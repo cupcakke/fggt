@@ -1,73 +1,46 @@
 const std = @import("std");
-
-const Allocator = std.mem.Allocator;
 const mem = std.mem;
 const math = std.math;
+const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Complex = std.math.Complex;
 
-fn mix64(x: u64) u64 {
-    var z = x;
-    z ^= z >> 30;
-    z *%= 0xbf58476d1ce4e5b9;
-    z ^= z >> 27;
-    z *%= 0x94d049bb133111eb;
-    z ^= z >> 31;
-    return z;
-}
-
-fn stableHash(data: []const u8, seed: u64) u64 {
-    var h: u64 = seed ^ 0x9E3779B97F4A7C15;
-    var i: usize = 0;
-    while (i + 8 <= data.len) : (i += 8) {
-        const chunk = std.mem.readInt(u64, data[i..][0..8], .little);
-        h ^= chunk;
-        h = mix64(h);
-    }
-    if (i < data.len) {
-        var tail: u64 = 0;
-        var j: usize = 0;
-        while (i + j < data.len) : (j += 1) {
-            tail |= @as(u64, data[i + j]) << @intCast(j * 8);
-        }
-        h ^= tail;
-        h = mix64(h);
-    }
-    h ^= @as(u64, data.len);
-    h = mix64(h);
-    return h;
-}
-
-fn createFilePath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
-    return std.fs.cwd().createFile(path, flags);
-}
-
-fn openFilePath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
-    return std.fs.cwd().openFile(path, flags);
-}
+pub const Error = error{
+    OutOfBounds,
+    ShapeMismatch,
+};
 
 pub const Tensor = struct {
     data: []f32,
-    dims: []const usize,
+    shape: struct { dims: []const usize },
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, dims: []const usize) !Tensor {
-        var total: usize = 1;
-        for (dims) |d| total = std.math.mul(usize, total, d) catch return error.OutOfMemory;
-        const data = try allocator.alloc(f32, total);
-        errdefer allocator.free(data);
-        @memset(data, 0.0);
         const dims_copy = try allocator.dupe(usize, dims);
-        return .{ .data = data, .dims = dims_copy, .allocator = allocator };
+        errdefer allocator.free(dims_copy);
+        var elements: usize = 1;
+        for (dims_copy) |dim| {
+            elements = std.math.mul(usize, elements, dim) catch return error.Overflow;
+        }
+        const data = try allocator.alloc(f32, elements);
+        return Tensor{
+            .data = data,
+            .shape = .{ .dims = dims_copy },
+            .allocator = allocator,
+        };
     }
 
     pub fn deinit(self: *Tensor) void {
-        if (self.data.len != 0) self.allocator.free(self.data);
-        if (self.dims.len != 0) self.allocator.free(self.dims);
-        self.data = &.{};
-        self.dims = &.{};
+        self.allocator.free(self.data);
+        self.allocator.free(self.shape.dims);
+        self.data = &[_]f32{};
+        self.shape.dims = &[_]usize{};
+    }
+
+    pub fn elementCount(self: *const Tensor) usize {
+        return self.data.len;
     }
 };
 
@@ -79,47 +52,71 @@ pub const BitSet = struct {
         const words = (num_bits + 63) / 64;
         const bits = try allocator.alloc(u64, words);
         @memset(bits, 0);
-        return .{ .bits = bits, .allocator = allocator };
+        return BitSet{ .bits = bits, .allocator = allocator };
     }
 
     pub fn deinit(self: *BitSet) void {
-        if (self.bits.len != 0) self.allocator.free(self.bits);
-        self.bits = &.{};
+        self.allocator.free(self.bits);
+        self.bits = &[_]u64{};
+    }
+
+    fn growFor(self: *BitSet, index: usize) !void {
+        const needed_words = (index / 64) + 1;
+        if (needed_words <= self.bits.len) return;
+        var new_words = self.bits.len;
+        if (new_words == 0) new_words = 1;
+        while (new_words < needed_words) new_words *= 2;
+        const grown = try self.allocator.realloc(self.bits, new_words);
+        @memset(grown[self.bits.len..], 0);
+        self.bits = grown;
     }
 
     pub fn set(self: *BitSet, index: usize) void {
-        const word = index / 64;
-        if (word < self.bits.len) {
-            self.bits[word] |= @as(u64, 1) << @intCast(index % 64);
-        }
+        std.debug.assert(index / 64 < self.bits.len);
+        self.bits[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+    }
+
+    pub fn setGrow(self: *BitSet, index: usize) !void {
+        try self.growFor(index);
+        self.bits[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+    }
+
+    pub fn unset(self: *BitSet, index: usize) void {
+        if (index / 64 >= self.bits.len) return;
+        self.bits[index / 64] &= ~(@as(u64, 1) << @intCast(index % 64));
     }
 
     pub fn get(self: *const BitSet, index: usize) bool {
-        const word = index / 64;
-        if (word >= self.bits.len) return false;
-        return (self.bits[word] >> @intCast(index % 64)) & 1 == 1;
+        if (index / 64 >= self.bits.len) return false;
+        return (self.bits[index / 64] & (@as(u64, 1) << @intCast(index % 64))) != 0;
     }
 
-    pub fn popcount(self: *const BitSet) usize {
-        var n: usize = 0;
-        for (self.bits) |w| n += @popCount(w);
-        return n;
-    }
-
-    pub fn intersectPop(self: *const BitSet, other: *const BitSet) usize {
-        var n: usize = 0;
-        const l = @min(self.bits.len, other.bits.len);
+    pub fn intersectionPopCount(self: *const BitSet, other: *const BitSet) usize {
+        const words = @min(self.bits.len, other.bits.len);
+        var count: usize = 0;
         var i: usize = 0;
-        while (i < l) : (i += 1) n += @popCount(self.bits[i] & other.bits[i]);
-        return n;
+        while (i < words) : (i += 1) {
+            count += @popCount(self.bits[i] & other.bits[i]);
+        }
+        return count;
     }
 
-    pub fn unionPop(self: *const BitSet, other: *const BitSet) usize {
-        var n: usize = 0;
-        const l = @min(self.bits.len, other.bits.len);
+    pub fn unionPopCount(self: *const BitSet, other: *const BitSet) usize {
+        const words = @max(self.bits.len, other.bits.len);
+        var count: usize = 0;
         var i: usize = 0;
-        while (i < l) : (i += 1) n += @popCount(self.bits[i] | other.bits[i]);
-        return n;
+        while (i < words) : (i += 1) {
+            const a: u64 = if (i < self.bits.len) self.bits[i] else 0;
+            const b: u64 = if (i < other.bits.len) other.bits[i] else 0;
+            count += @popCount(a | b);
+        }
+        return count;
+    }
+
+    pub fn jaccardEstimate(self: *const BitSet, other: *const BitSet) f32 {
+        const union_count = self.unionPopCount(other);
+        if (union_count == 0) return 1.0;
+        return @as(f32, @floatFromInt(self.intersectionPopCount(other))) / @as(f32, @floatFromInt(union_count));
     }
 };
 
@@ -130,31 +127,55 @@ pub const RankedSegment = struct {
     anchor: bool,
 
     pub fn init(allocator: Allocator, tokens: []const u32, score: f32, position: u64, anchor: bool) !RankedSegment {
-        return .{
+        return RankedSegment{
             .tokens = try allocator.dupe(u32, tokens),
-            .position = position,
             .score = score,
+            .position = position,
             .anchor = anchor,
         };
     }
 
     pub fn deinit(self: *RankedSegment, allocator: Allocator) void {
-        if (self.tokens.len != 0) allocator.free(self.tokens);
-        self.tokens = &.{};
+        allocator.free(self.tokens);
+        self.tokens = &[_]u32{};
     }
 };
 
-const Error = error{ ShapeMismatch, OutOfBounds };
+pub fn stableHash(data: []const u8, seed: u64) u64 {
+    var h = seed ^ 0xcbf29ce484222325;
+    for (data) |byte| {
+        h ^= byte;
+        h *%= 0x100000001b3;
+    }
+    h ^= h >> 30;
+    h *%= 0xbf58476d1ce4e5b9;
+    h ^= h >> 27;
+    h *%= 0x94d049bb133111eb;
+    h ^= h >> 31;
+    return h;
+}
+
+pub fn createFilePath(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+    return std.fs.cwd().createFile(path, flags);
+}
+
+pub fn openFilePath(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+    return std.fs.cwd().openFile(path, flags);
+}
 
 pub const ArenaAllocator = struct {
     inner: std.heap.ArenaAllocator,
 
-    pub fn init(backing: Allocator) ArenaAllocator {
-        return .{ .inner = std.heap.ArenaAllocator.init(backing) };
+    pub fn init(child_allocator: Allocator) ArenaAllocator {
+        return ArenaAllocator{ .inner = std.heap.ArenaAllocator.init(child_allocator) };
     }
 
     pub fn allocator(self: *ArenaAllocator) Allocator {
         return self.inner.allocator();
+    }
+
+    pub fn reset(self: *ArenaAllocator) void {
+        _ = self.inner.reset(.retain_capacity);
     }
 
     pub fn deinit(self: *ArenaAllocator) void {
@@ -163,265 +184,308 @@ pub const ArenaAllocator = struct {
 };
 
 pub const PoolAllocator = struct {
-    gpa: std.heap.GeneralPurposeAllocator(.{}) = .{},
+    inner: std.heap.GeneralPurposeAllocator(.{
+        .enable_memory_limit = true,
+        .retain_metadata = true,
+    }),
 
-    pub fn init(_: Allocator) @This() {
-        return .{};
+    pub fn init(_: Allocator) PoolAllocator {
+        return PoolAllocator{ .inner = .{} };
     }
 
-    pub fn allocator(self: *@This()) Allocator {
-        return self.gpa.allocator();
+    pub fn allocator(self: *PoolAllocator) Allocator {
+        return self.inner.allocator();
     }
 
-    pub fn deinit(self: *@This()) void {
-        _ = self.gpa.deinit();
+    pub fn deinit(self: *PoolAllocator) void {
+        _ = self.inner.deinit();
     }
 };
 
 pub const BuddyAllocator = struct {
-    gpa: std.heap.GeneralPurposeAllocator(.{}) = .{},
+    inner: std.heap.GeneralPurposeAllocator(.{}),
 
-    pub fn init(_: Allocator) @This() {
-        return .{};
+    pub fn init(_: Allocator) BuddyAllocator {
+        return BuddyAllocator{ .inner = .{} };
     }
 
-    pub fn allocator(self: *@This()) Allocator {
-        return self.gpa.allocator();
+    pub fn allocator(self: *BuddyAllocator) Allocator {
+        return self.inner.allocator();
     }
 
-    pub fn deinit(self: *@This()) void {
-        _ = self.gpa.deinit();
+    pub fn deinit(self: *BuddyAllocator) void {
+        _ = self.inner.deinit();
     }
 };
 
-const nsir_core = struct {
-    pub const EdgeQuality = enum {
-        coherent,
-        decoherent,
-    };
+pub const EdgeQuality = enum(u8) {
+    coherent,
+    decoherent,
 
-    pub const Node = struct {
-        id: []u8,
-        label: []u8,
-        metadata: StringHashMap([]u8),
-        allocator: Allocator,
-        quantum_state: Complex(f64),
-        phase: f64,
-
-        pub fn init(allocator: Allocator, id: []const u8, label: []const u8) !Node {
-            return Node.initWithComplex(allocator, id, label, Complex(f64).init(1.0, 0.0), 0.0);
-        }
-
-        pub fn initWithComplex(allocator: Allocator, id: []const u8, label: []const u8, quantum_state: Complex(f64), phase: f64) !Node {
-            const id_copy = try allocator.dupe(u8, id);
-            errdefer allocator.free(id_copy);
-            const label_copy = try allocator.dupe(u8, label);
-            return .{
-                .id = id_copy,
-                .label = label_copy,
-                .metadata = StringHashMap([]u8).init(allocator),
-                .allocator = allocator,
-                .quantum_state = quantum_state,
-                .phase = phase,
-            };
-        }
-
-        pub fn deinit(self: *Node) void {
-            if (self.id.len != 0) self.allocator.free(self.id);
-            if (self.label.len != 0) self.allocator.free(self.label);
-            var it = self.metadata.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-            self.metadata.deinit();
-            self.id = &.{};
-            self.label = &.{};
-        }
-
-        pub fn setMetadata(self: *Node, key: []const u8, value: []const u8) !void {
-            const v_copy = try self.allocator.dupe(u8, value);
-            errdefer self.allocator.free(v_copy);
-            if (self.metadata.getPtr(key)) |existing_v| {
-                self.allocator.free(existing_v.*);
-                existing_v.* = v_copy;
-                return;
-            }
-            const k_copy = try self.allocator.dupe(u8, key);
-            errdefer self.allocator.free(k_copy);
-            try self.metadata.put(k_copy, v_copy);
-        }
-
-        pub fn getMetadata(self: *const Node, key: []const u8) ?[]const u8 {
-            return self.metadata.get(key);
-        }
-    };
-
-    pub const Edge = struct {
-        source: []u8,
-        target: []u8,
-        quality: EdgeQuality,
-        weight: f64,
-        metadata: StringHashMap([]u8),
-        allocator: Allocator,
-        quantum_state: Complex(f64),
-        phase: f64,
-
-        pub fn init(allocator: Allocator, source: []const u8, target: []const u8, quality: EdgeQuality, weight: f64) !Edge {
-            return Edge.initWithComplex(allocator, source, target, quality, weight, Complex(f64).init(weight, 0.0), 1.0);
-        }
-
-        pub fn initWithComplex(allocator: Allocator, source: []const u8, target: []const u8, quality: EdgeQuality, weight: f64, quantum_state: Complex(f64), phase: f64) !Edge {
-            const source_copy = try allocator.dupe(u8, source);
-            errdefer allocator.free(source_copy);
-            const target_copy = try allocator.dupe(u8, target);
-            return .{
-                .source = source_copy,
-                .target = target_copy,
-                .quality = quality,
-                .weight = weight,
-                .metadata = StringHashMap([]u8).init(allocator),
-                .allocator = allocator,
-                .quantum_state = quantum_state,
-                .phase = phase,
-            };
-        }
-
-        pub fn deinit(self: *Edge) void {
-            if (self.source.len != 0) self.allocator.free(self.source);
-            if (self.target.len != 0) self.allocator.free(self.target);
-            var it = self.metadata.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-            self.metadata.deinit();
-            self.source = &.{};
-            self.target = &.{};
-        }
-
-        pub fn setMetadata(self: *Edge, key: []const u8, value: []const u8) !void {
-            const v_copy = try self.allocator.dupe(u8, value);
-            errdefer self.allocator.free(v_copy);
-            if (self.metadata.getPtr(key)) |existing_v| {
-                self.allocator.free(existing_v.*);
-                existing_v.* = v_copy;
-                return;
-            }
-            const k_copy = try self.allocator.dupe(u8, key);
-            errdefer self.allocator.free(k_copy);
-            try self.metadata.put(k_copy, v_copy);
-        }
-
-        pub fn getMetadata(self: *const Edge, key: []const u8) ?[]const u8 {
-            return self.metadata.get(key);
-        }
-    };
-
-    pub const SelfSimilarRelationalGraph = struct {
-        allocator: Allocator,
-        nodes: ArrayList(*Node),
-        edges: ArrayList(*Edge),
-
-        pub fn init(allocator: Allocator) SelfSimilarRelationalGraph {
-            return .{
-                .allocator = allocator,
-                .nodes = ArrayList(*Node).init(allocator),
-                .edges = ArrayList(*Edge).init(allocator),
-            };
-        }
-
-        pub fn deinit(self: *SelfSimilarRelationalGraph) void {
-            for (self.nodes.items) |n| {
-                n.deinit();
-                self.allocator.destroy(n);
-            }
-            for (self.edges.items) |e| {
-                e.deinit();
-                self.allocator.destroy(e);
-            }
-            self.nodes.deinit();
-            self.edges.deinit();
-        }
-
-        pub fn addNode(self: *SelfSimilarRelationalGraph, node: Node) !usize {
-            const n_copy = try self.allocator.create(Node);
-            n_copy.* = node;
-            try self.nodes.append(n_copy);
-            return self.nodes.items.len - 1;
-        }
-
-        pub fn addEdge(self: *SelfSimilarRelationalGraph, edge: Edge) !usize {
-            const e_copy = try self.allocator.create(Edge);
-            e_copy.* = edge;
-            try self.edges.append(e_copy);
-            return self.edges.items.len - 1;
-        }
-    };
+    pub fn toString(self: EdgeQuality) []const u8 {
+        return switch (self) {
+            .coherent => "coherent",
+            .decoherent => "decoherent",
+        };
+    }
 };
 
-const chaos_core = struct {
-    pub const ChaosCoreKernel = struct {
-        allocator: Allocator,
-        nodes: ArrayList(*nsir_core.Node),
-        edges: ArrayList(*nsir_core.Edge),
-        memory: ArrayList([]u8),
-        memory_tags: ArrayList(?[]u8),
+pub const Node = struct {
+    id: []u8,
+    label: []u8,
+    quantum_state: Complex(f64),
+    phase: f64,
+    metadata: StringHashMap([]u8),
+    allocator: Allocator,
 
-        pub fn init(allocator: Allocator) ChaosCoreKernel {
-            return .{
-                .allocator = allocator,
-                .nodes = ArrayList(*nsir_core.Node).init(allocator),
-                .edges = ArrayList(*nsir_core.Edge).init(allocator),
-                .memory = ArrayList([]u8).init(allocator),
-                .memory_tags = ArrayList(?[]u8).init(allocator),
-            };
+    pub fn init(allocator: Allocator, id: []const u8, label: []const u8) !Node {
+        return initWithComplex(allocator, id, label, Complex(f64).init(1.0, 0.0), 0.0);
+    }
+
+    pub fn initWithComplex(allocator: Allocator, id: []const u8, label: []const u8, quantum_state: Complex(f64), phase: f64) !Node {
+        const id_copy = try allocator.dupe(u8, id);
+        errdefer allocator.free(id_copy);
+        const label_copy = try allocator.dupe(u8, label);
+        errdefer allocator.free(label_copy);
+        return Node{
+            .id = id_copy,
+            .label = label_copy,
+            .quantum_state = quantum_state,
+            .phase = phase,
+            .metadata = StringHashMap([]u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Node) void {
+        self.allocator.free(self.id);
+        self.allocator.free(self.label);
+        var it = self.metadata.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
         }
+        self.metadata.deinit();
+        self.id = &[_]u8{};
+        self.label = &[_]u8{};
+    }
 
-        pub fn deinit(self: *ChaosCoreKernel) void {
-            for (self.nodes.items) |n| {
-                n.deinit();
-                self.allocator.destroy(n);
-            }
-            for (self.edges.items) |e| {
-                e.deinit();
-                self.allocator.destroy(e);
-            }
-            for (self.memory.items) |m| {
-                if (m.len != 0) self.allocator.free(m);
-            }
-            for (self.memory_tags.items) |t| {
-                if (t) |tag| {
-                    if (tag.len != 0) self.allocator.free(tag);
-                }
-            }
-            self.nodes.deinit();
-            self.edges.deinit();
-            self.memory.deinit();
-            self.memory_tags.deinit();
+    pub fn setMetadata(self: *Node, key: []const u8, value: []const u8) !void {
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+        if (self.metadata.getPtr(key)) |existing| {
+            self.allocator.free(existing.*);
+            existing.* = value_copy;
+            return;
         }
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        try self.metadata.put(key_copy, value_copy);
+    }
 
-        pub fn allocateMemory(self: *ChaosCoreKernel, data: []const u8, tag: ?[]const u8) !usize {
-            const data_copy = try self.allocator.dupe(u8, data);
-            errdefer self.allocator.free(data_copy);
-            var tag_copy: ?[]u8 = null;
-            if (tag) |t| {
-                tag_copy = try self.allocator.dupe(u8, t);
-                errdefer if (tag_copy) |tc| self.allocator.free(tc);
-            }
-            try self.memory.append(data_copy);
-            errdefer _ = self.memory.pop();
-            try self.memory_tags.append(tag_copy);
-            errdefer _ = self.memory_tags.pop();
-            return self.memory.items.len - 1;
+    pub fn getMetadata(self: *const Node, key: []const u8) ?[]const u8 {
+        return self.metadata.get(key);
+    }
+};
+
+pub const Edge = struct {
+    source: []u8,
+    target: []u8,
+    quality: EdgeQuality,
+    weight: f64,
+    quantum_state: Complex(f64),
+    frequency: f64,
+    metadata: StringHashMap([]u8),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, source: []const u8, target: []const u8, quality: EdgeQuality, weight: f64) !Edge {
+        return initWithComplex(allocator, source, target, quality, weight, Complex(f64).init(1.0, 0.0), 0.0);
+    }
+
+    pub fn initWithComplex(allocator: Allocator, source: []const u8, target: []const u8, quality: EdgeQuality, weight: f64, quantum_state: Complex(f64), frequency: f64) !Edge {
+        const source_copy = try allocator.dupe(u8, source);
+        errdefer allocator.free(source_copy);
+        const target_copy = try allocator.dupe(u8, target);
+        errdefer allocator.free(target_copy);
+        return Edge{
+            .source = source_copy,
+            .target = target_copy,
+            .quality = quality,
+            .weight = weight,
+            .quantum_state = quantum_state,
+            .frequency = frequency,
+            .metadata = StringHashMap([]u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Edge) void {
+        self.allocator.free(self.source);
+        self.allocator.free(self.target);
+        var it = self.metadata.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
         }
+        self.metadata.deinit();
+        self.source = &[_]u8{};
+        self.target = &[_]u8{};
+    }
 
-        pub fn getMemory(self: *const ChaosCoreKernel, index: usize) ?[]const u8 {
-            if (index >= self.memory.items.len) return null;
-            return self.memory.items[index];
+    pub fn setMetadata(self: *Edge, key: []const u8, value: []const u8) !void {
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+        if (self.metadata.getPtr(key)) |existing| {
+            self.allocator.free(existing.*);
+            existing.* = value_copy;
+            return;
+        }
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        try self.metadata.put(key_copy, value_copy);
+    }
+
+    pub fn getMetadata(self: *const Edge, key: []const u8) ?[]const u8 {
+        return self.metadata.get(key);
+    }
+};
+
+pub const SelfSimilarRelationalGraph = struct {
+    nodes: ArrayList(Node),
+    edges: ArrayList(Edge),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) SelfSimilarRelationalGraph {
+        return SelfSimilarRelationalGraph{
+            .nodes = ArrayList(Node).init(allocator),
+            .edges = ArrayList(Edge).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *SelfSimilarRelationalGraph) void {
+        for (self.nodes.items) |*node| node.deinit();
+        self.nodes.deinit();
+        for (self.edges.items) |*edge| edge.deinit();
+        self.edges.deinit();
+    }
+
+    pub fn addNode(self: *SelfSimilarRelationalGraph, node: Node) !void {
+        try self.nodes.append(node);
+    }
+
+    pub fn addEdge(self: *SelfSimilarRelationalGraph, edge: Edge) !void {
+        try self.edges.append(edge);
+    }
+
+    pub fn nodeCount(self: *const SelfSimilarRelationalGraph) usize {
+        return self.nodes.items.len;
+    }
+
+    pub fn edgeCount(self: *const SelfSimilarRelationalGraph) usize {
+        return self.edges.items.len;
+    }
+
+    pub fn findNodeById(self: *const SelfSimilarRelationalGraph, id: []const u8) ?*Node {
+        for (self.nodes.items) |*node| {
+            if (std.mem.eql(u8, node.id, id)) return node;
+        }
+        return null;
+    }
+
+    pub fn coherenceRatio(self: *const SelfSimilarRelationalGraph) f64 {
+        if (self.edges.items.len == 0) return 1.0;
+        var coherent: usize = 0;
+        for (self.edges.items) |edge| {
+            if (edge.quality == .coherent) coherent += 1;
+        }
+        return @as(f64, @floatFromInt(coherent)) / @as(f64, @floatFromInt(self.edges.items.len));
+    }
+};
+
+pub const ChaosCoreKernel = struct {
+    allocator: Allocator,
+    blocks: ArrayList(MemoryBlock),
+    graph: SelfSimilarRelationalGraph,
+    mutex: std.Thread.Mutex,
+
+    pub const MemoryBlock = struct {
+        data: []u8,
+        tag: ?[]u8,
+
+        fn deinit(self: *MemoryBlock, allocator: Allocator) void {
+            allocator.free(self.data);
+            if (self.tag) |t| allocator.free(t);
+            self.data = &[_]u8{};
+            self.tag = null;
         }
     };
+
+    pub fn init(allocator: Allocator) ChaosCoreKernel {
+        return ChaosCoreKernel{
+            .allocator = allocator,
+            .blocks = ArrayList(MemoryBlock).init(allocator),
+            .graph = SelfSimilarRelationalGraph.init(allocator),
+            .mutex = .{},
+        };
+    }
+
+    pub fn deinit(self: *ChaosCoreKernel) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.blocks.items) |*block| block.deinit(self.allocator);
+        self.blocks.deinit();
+        self.graph.deinit();
+    }
+
+    pub fn allocateMemory(self: *ChaosCoreKernel, data: []const u8, tag: ?[]const u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const data_copy = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(data_copy);
+        var tag_copy: ?[]u8 = null;
+        if (tag) |t| {
+            tag_copy = try self.allocator.dupe(u8, t);
+        }
+        errdefer if (tag_copy) |tc| self.allocator.free(tc);
+        try self.blocks.append(.{ .data = data_copy, .tag = tag_copy });
+        return self.blocks.items.len - 1;
+    }
+
+    pub fn getMemory(self: *ChaosCoreKernel, index: usize) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.blocks.items.len) return null;
+        return self.blocks.items[index].data;
+    }
+
+    pub fn memoryCount(self: *ChaosCoreKernel) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.blocks.items.len;
+    }
+
+    pub fn synchronizeGraphWithMemory(self: *ChaosCoreKernel) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var synchronized: usize = 0;
+        for (self.blocks.items, 0..) |block, index| {
+            var id_buf: [32]u8 = undefined;
+            const id_text = std.fmt.bufPrint(id_buf[0..], "mem_{d}", .{index}) catch continue;
+            if (self.graph.findNodeById(id_text) != null) continue;
+            var node = try Node.init(self.allocator, id_text, block.data);
+            errdefer node.deinit();
+            if (block.tag) |t| {
+                try node.setMetadata("tag", t);
+            }
+            try self.graph.addNode(node);
+            synchronized += 1;
+        }
+        return synchronized;
+    }
 };
+
+
 pub const MGT = struct {
     token_to_id: std.StringHashMap(u32),
     id_to_token: std.AutoHashMap(u32, []const u8),
@@ -446,6 +510,7 @@ pub const MGT = struct {
     pub const Language = enum {
         english,
         hungarian,
+        dual,
     };
 
     const BPEMerge = struct {
@@ -611,29 +676,34 @@ pub const MGT = struct {
             "kor", "ra", "re",
         };
 
-        for (english_prefix_list) |prefix| {
-            if (!self.canAddToken() and !self.token_to_id.contains(prefix)) break;
-            const id = self.token_to_id.get(prefix) orelse try self.addToken(prefix);
-            const key = self.id_to_token.get(id) orelse return error.InvalidData;
-            try self.prefixes.put(key, id);
+        const prefix_lists: [2][]const []const u8 = switch (self.language) {
+            .english => .{ english_prefix_list[0..], english_prefix_list[0..0] },
+            .hungarian => .{ hungarian_prefix_list[0..], hungarian_prefix_list[0..0] },
+            .dual => .{ english_prefix_list[0..], hungarian_prefix_list[0..] },
+        };
+
+        const suffix_lists: [2][]const []const u8 = switch (self.language) {
+            .english => .{ english_suffix_list[0..], english_suffix_list[0..0] },
+            .hungarian => .{ hungarian_suffix_list[0..], hungarian_suffix_list[0..0] },
+            .dual => .{ english_suffix_list[0..], hungarian_suffix_list[0..] },
+        };
+
+        for (prefix_lists) |prefix_list| {
+            for (prefix_list) |prefix| {
+                if (!self.canAddToken() and !self.token_to_id.contains(prefix)) break;
+                const id = self.token_to_id.get(prefix) orelse try self.addToken(prefix);
+                const key = self.id_to_token.get(id) orelse return error.InvalidData;
+                try self.prefixes.put(key, id);
+            }
         }
-        for (hungarian_prefix_list) |prefix| {
-            if (!self.canAddToken() and !self.token_to_id.contains(prefix)) break;
-            const id = self.token_to_id.get(prefix) orelse try self.addToken(prefix);
-            const key = self.id_to_token.get(id) orelse return error.InvalidData;
-            try self.prefixes.put(key, id);
-        }
-        for (english_suffix_list) |suffix| {
-            if (!self.canAddToken() and !self.token_to_id.contains(suffix)) break;
-            const id = self.token_to_id.get(suffix) orelse try self.addToken(suffix);
-            const key = self.id_to_token.get(id) orelse return error.InvalidData;
-            try self.suffixes.put(key, id);
-        }
-        for (hungarian_suffix_list) |suffix| {
-            if (!self.canAddToken() and !self.token_to_id.contains(suffix)) break;
-            const id = self.token_to_id.get(suffix) orelse try self.addToken(suffix);
-            const key = self.id_to_token.get(id) orelse return error.InvalidData;
-            try self.suffixes.put(key, id);
+
+        for (suffix_lists) |suffix_list| {
+            for (suffix_list) |suffix| {
+                if (!self.canAddToken() and !self.token_to_id.contains(suffix)) break;
+                const id = self.token_to_id.get(suffix) orelse try self.addToken(suffix);
+                const key = self.id_to_token.get(id) orelse return error.InvalidData;
+                try self.suffixes.put(key, id);
+            }
         }
 
         try self.rebuildSortedMorphemes();
@@ -2156,8 +2226,164 @@ pub const MGT = struct {
     }
 };
 
+test "MGT encode decode" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const vocab = &.{ "hello", "world", " " };
+    const anchors = &.{"hello"};
+
+    var mgt = try MGT.init(gpa, vocab, anchors, null, .english);
+    defer mgt.deinit();
+
+    var tokens = std.ArrayList(u32).init(gpa);
+    defer tokens.deinit();
+
+    try mgt.encode("hello world", &tokens);
+    try testing.expect(tokens.items.len >= 3);
+
+    var text = std.ArrayList(u8).init(gpa);
+    defer text.deinit();
+
+    try mgt.decode(tokens.items, &text);
+    try testing.expectEqualStrings("hello world", text.items);
+}
+
+test "MGT add remove vocab" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var mgt = try MGT.init(gpa, &.{}, &.{}, null, .english);
+    defer mgt.deinit();
+
+    try mgt.addVocabWord("test", true);
+    try testing.expect(mgt.anchors.contains("test"));
+
+    mgt.removeVocabWord("test");
+
+    try testing.expect(!mgt.anchors.contains("test"));
+    try testing.expect(!mgt.token_to_id.contains("test"));
+}
+
+test "MGT longest match" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var mgt = try MGT.init(gpa, &.{ "hello", "hell" }, &.{}, null, .english);
+    defer mgt.deinit();
+
+    const len = mgt.longestMatch("hello", 0);
+    try testing.expectEqual(@as(usize, 5), len);
+}
+
+test "MGT batch encode" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var mgt = try MGT.init(gpa, &.{ "a", "b" }, &.{}, null, .english);
+    defer mgt.deinit();
+
+    const texts = &.{ "a", "b" };
+    const batches = try mgt.encodeBatch(texts, gpa);
+
+    defer {
+        for (batches) |batch| {
+            gpa.free(batch);
+        }
+        gpa.free(batches);
+    }
+
+    try testing.expectEqual(@as(usize, 2), batches.len);
+    try testing.expectEqual(@as(usize, 1), batches[0].len);
+    try testing.expectEqual(@as(usize, 1), batches[1].len);
+}
+
+test "MGT subword split" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var mgt = try MGT.init(gpa, &.{ "hel", "lo" }, &.{}, null, .english);
+    defer mgt.deinit();
+
+    const subwords = try mgt.subwordSplit("hello");
+    defer gpa.free(subwords);
+
+    try testing.expectEqual(@as(usize, 2), subwords.len);
+    try testing.expect(mgt.validateTokens(subwords));
+}
+
+test "MGT coverage" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var mgt = try MGT.init(gpa, &.{ "hello", "world", " " }, &.{}, null, .english);
+    defer mgt.deinit();
+
+    const result = mgt.coverage("hello world");
+    try testing.expect(result > 0.99);
+}
+
+test "MGT BPE training" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const corpus = &.{
+        "lower",
+        "lowest",
+        "newer",
+        "wider",
+        "lower",
+        "lowest",
+    };
+
+    var mgt = try MGT.init(gpa, &.{}, &.{}, 512, .english);
+    defer mgt.deinit();
+
+    try mgt.trainBPE(corpus, 320);
+
+    var encoded = std.ArrayList(u32).init(gpa);
+    defer encoded.deinit();
+
+    try mgt.encode("lower", &encoded);
+    try testing.expect(encoded.items.len > 0);
+    try testing.expect(mgt.validateTokens(encoded.items));
+
+    var decoded = std.ArrayList(u8).init(gpa);
+    defer decoded.deinit();
+
+    try mgt.decode(encoded.items, &decoded);
+    try testing.expectEqualStrings("lower", decoded.items);
+}
+
+test "MGT empty BPE corpus" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var mgt = try MGT.init(gpa, &.{}, &.{}, 512, .english);
+    defer mgt.deinit();
+
+    try mgt.trainBPE(&.{}, 320);
+    try testing.expect(mgt.vocabSize() >= 4);
+}
+
+test "MGT BPE target vocabulary size" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const corpus = &.{
+        "aaaaaaaa",
+        "aaaaaaaa",
+        "abababab",
+        "abababab",
+    };
+
+    var mgt = try MGT.init(gpa, &.{}, &.{}, 512, .english);
+    defer mgt.deinit();
+
+    try mgt.trainBPE(corpus, 300);
+    try testing.expect(mgt.vocabSize() <= 300);
+}
+
+
 pub const SSI = struct {
-    root: ?*Node,
+    root: ?*BucketNode,
     allocator: Allocator,
     height: usize = 0,
     size: usize = 0,
@@ -2212,18 +2438,18 @@ pub const SSI = struct {
         next: ?*CollisionNode,
     };
 
-    const Node = struct {
+    const BucketNode = struct {
         hash: u64,
-        children: ?[]?*Node,
+        children: ?[]?*BucketNode,
         segment: ?Segment,
         collision_chain: ?*CollisionNode,
         height: usize,
         is_leaf: bool,
 
-        pub fn init(allocator: Allocator, height: usize) !Node {
-            var children: ?[]?*Node = null;
+        pub fn init(allocator: Allocator, height: usize) !BucketNode {
+            var children: ?[]?*BucketNode = null;
             if (height > 0) {
-                const allocated = try allocator.alloc(?*Node, bucket_count);
+                const allocated = try allocator.alloc(?*BucketNode, bucket_count);
                 @memset(allocated, null);
                 children = allocated;
             }
@@ -2237,7 +2463,7 @@ pub const SSI = struct {
             };
         }
 
-        pub fn deinit(self: *Node, allocator: Allocator) void {
+        pub fn deinit(self: *BucketNode, allocator: Allocator) void {
             if (self.segment) |*seg| {
                 seg.deinit(allocator);
                 self.segment = null;
@@ -2384,7 +2610,7 @@ pub const SSI = struct {
         return std.math.clamp(v, -3.4e38, 3.4e38);
     }
 
-    fn recursiveDeinit(node: *Node, allocator: Allocator) void {
+    fn recursiveDeinit(node: *BucketNode, allocator: Allocator) void {
         if (node.children) |children| {
             for (children) |maybe_child| {
                 if (maybe_child) |child| {
@@ -2405,7 +2631,7 @@ pub const SSI = struct {
         self.size = 0;
     }
 
-    fn computeLeafHash(node: *const Node) u64 {
+    fn computeLeafHash(node: *const BucketNode) u64 {
         var acc: u64 = 0;
         if (node.segment) |seg| {
             acc +%= seg.fullHash();
@@ -2418,7 +2644,7 @@ pub const SSI = struct {
         return acc;
     }
 
-    fn computeBranchHash(node: *const Node) u64 {
+    fn computeBranchHash(node: *const BucketNode) u64 {
         var acc: u64 = 0;
         if (node.children) |children| {
             for (children) |maybe_child| {
@@ -2430,14 +2656,14 @@ pub const SSI = struct {
         return acc;
     }
 
-    fn refreshHash(node: *Node) void {
+    fn refreshHash(node: *BucketNode) void {
         node.hash = if (node.is_leaf) computeLeafHash(node) else computeBranchHash(node);
     }
 
-    fn ensureRoot(self: *SSI) !*Node {
+    fn ensureRoot(self: *SSI) !*BucketNode {
         if (self.root == null) {
-            const root = try self.allocator.create(Node);
-            root.* = try Node.init(self.allocator, bucket_width);
+            const root = try self.allocator.create(BucketNode);
+            root.* = try BucketNode.init(self.allocator, bucket_width);
             root.is_leaf = false;
             root.height = bucket_width;
             refreshHash(root);
@@ -2447,7 +2673,7 @@ pub const SSI = struct {
         return self.root.?;
     }
 
-    fn insertIntoLeaf(self: *SSI, leaf: *Node, tokens: []const u32, position: u64, score: f32, anchor_hash: u64) !bool {
+    fn insertIntoLeaf(self: *SSI, leaf: *BucketNode, tokens: []const u32, position: u64, score: f32, anchor_hash: u64) !bool {
         if (!leaf.is_leaf or leaf.height != 0) {
             return error.InvalidNodeState;
         }
@@ -2487,8 +2713,8 @@ pub const SSI = struct {
         const root = try self.ensureRoot();
         const idx = bucketIndex(position);
         if (root.children.?[idx] == null) {
-            const leaf = try self.allocator.create(Node);
-            leaf.* = try Node.init(self.allocator, 0);
+            const leaf = try self.allocator.create(BucketNode);
+            leaf.* = try BucketNode.init(self.allocator, 0);
             root.children.?[idx] = leaf;
         }
         const leaf = root.children.?[idx].?;
@@ -2561,7 +2787,7 @@ pub const SSI = struct {
         return top_n;
     }
 
-    fn traverse(self: *const SSI, node: ?*Node, query_hash: u64, query_signature: u64, heap: anytype, k: usize, allocator: Allocator) !void {
+    fn traverse(self: *const SSI, node: ?*BucketNode, query_hash: u64, query_signature: u64, heap: anytype, k: usize, allocator: Allocator) !void {
         if (node == null) {
             return;
         }
@@ -2744,7 +2970,7 @@ pub const SSI = struct {
         };
     }
 
-    fn serializeNode(node: *const Node, writer: anytype) !void {
+    fn serializeNode(node: *const BucketNode, writer: anytype) !void {
         try writeBoolFlag(writer, node.is_leaf);
         try writer.writeInt(u64, @as(u64, node.height), .little);
         try writer.writeInt(u64, node.hash, .little);
@@ -2777,20 +3003,20 @@ pub const SSI = struct {
         }
     }
 
-    fn deserializeNode(allocator: Allocator, reader: anytype) !*Node {
+    fn deserializeNode(allocator: Allocator, reader: anytype) !*BucketNode {
         const is_leaf = try readBoolFlag(reader);
         const height_raw = try reader.readInt(u64, .little);
         if (height_raw > std.math.maxInt(usize)) return error.InvalidData;
         const height: usize = @intCast(height_raw);
         const stored_hash = try reader.readInt(u64, .little);
-        const node = try allocator.create(Node);
+        const node = try allocator.create(BucketNode);
         var cleanup = true;
         errdefer {
             if (cleanup) {
                 recursiveDeinit(node, allocator);
             }
         }
-        node.* = try Node.init(allocator, if (is_leaf) 0 else height);
+        node.* = try BucketNode.init(allocator, if (is_leaf) 0 else height);
         if (node.is_leaf != is_leaf) {
             return error.InvalidData;
         }
@@ -3010,7 +3236,7 @@ pub const SSI = struct {
         var leaves: usize = 0;
         var depth: usize = 0;
         const root = self.root orelse return .{ .nodes = 0, .leaves = 0, .depth = 0 };
-        var stack = std.ArrayList(struct { node: *const Node, d: usize }).init(self.allocator);
+        var stack = std.ArrayList(struct { node: *const BucketNode, d: usize }).init(self.allocator);
         defer stack.deinit();
         stack.append(.{ .node = root, .d = 0 }) catch return .{ .nodes = nodes, .leaves = leaves, .depth = depth };
         while (stack.pop()) |entry| {
@@ -3032,7 +3258,7 @@ pub const SSI = struct {
         return .{ .nodes = nodes, .leaves = leaves, .depth = depth };
     }
 
-    fn validateLeaf(node: *const Node) bool {
+    fn validateLeaf(node: *const BucketNode) bool {
         if (!node.is_leaf) {
             return false;
         }
@@ -3048,7 +3274,7 @@ pub const SSI = struct {
         return computeLeafHash(node) == node.hash;
     }
 
-    fn validateNode(node: *const Node, position_set: anytype) !bool {
+    fn validateNode(node: *const BucketNode, position_set: anytype) !bool {
         if (node.is_leaf) {
             if (!validateLeaf(node)) {
                 return false;
@@ -3100,6 +3326,9 @@ pub const SSI = struct {
         return true;
     }
 };
+
+
+
 pub const RankerConfig = struct {
     pub const STREAMING_BUFFER_SIZE: usize = 1024;
     pub const STREAMING_WINDOW_SIZE: usize = 512;
@@ -4284,6 +4513,340 @@ pub const Ranker = struct {
     }
 };
 
+test "Ranker score" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 4, 8, 42);
+    defer ranker.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    try ssi.addSequence(&.{ 1, 2, 3 }, 0, false);
+    const score = try ranker.scoreSequence(&.{ 1, 2 }, &ssi);
+    try testing.expect(score >= 0.0);
+}
+
+test "MinHash signature deterministic" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 32, 42);
+    defer ranker.deinit();
+    const sig1 = try ranker.minHashSignature(&.{ 1, 2, 3 });
+    defer gpa.free(sig1);
+    const sig2 = try ranker.minHashSignature(&.{ 1, 2, 3 });
+    defer gpa.free(sig2);
+    try testing.expectEqualSlices(u64, sig1, sig2);
+}
+
+test "Jaccard similarity from signatures" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 32, 42);
+    defer ranker.deinit();
+    const sig1 = try ranker.minHashSignature(&.{ 1, 2, 3 });
+    defer gpa.free(sig1);
+    const sig2 = try ranker.minHashSignature(&.{ 1, 2, 3 });
+    defer gpa.free(sig2);
+    const sim = Ranker.jaccardSimilarityFromSignatures(sig1, sig2);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), sim, @as(f32, 0.01));
+}
+
+test "Token diversity" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 1, 42);
+    defer ranker.deinit();
+    const div1 = try ranker.computeTokenDiversity(&.{ 1, 1, 1, 1 }, gpa);
+    const div2 = try ranker.computeTokenDiversity(&.{ 1, 2, 3, 4 }, gpa);
+    try testing.expect(div2 > div1);
+}
+
+test "Token overlap" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 1, 42);
+    defer ranker.deinit();
+    const overlap = try ranker.computeTokenOverlap(&.{ 1, 2, 3 }, &.{ 2, 3, 4 }, gpa);
+    try testing.expect(overlap > 0.0 and overlap <= 1.0);
+}
+
+test "Estimate Jaccard" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var set1 = try BitSet.init(gpa, 128);
+    defer set1.deinit();
+    set1.set(0);
+    set1.set(64);
+    var set2 = try BitSet.init(gpa, 128);
+    defer set2.deinit();
+    set2.set(0);
+    const est = Ranker.estimateJaccard(set1, set2);
+    try testing.expect(est >= 0.0 and est <= 1.0);
+}
+
+test "Estimate Jaccard empty sets" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var set1 = try BitSet.init(gpa, 64);
+    defer set1.deinit();
+    var set2 = try BitSet.init(gpa, 64);
+    defer set2.deinit();
+    const est = Ranker.estimateJaccard(set1, set2);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), est, 0.01);
+}
+
+test "Vector cosine score" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var emb = try Tensor.init(gpa, &.{3});
+    defer emb.deinit();
+    emb.data[0] = 1.0;
+    emb.data[1] = 0.0;
+    emb.data[2] = 0.0;
+    var qemb = try Tensor.init(gpa, &.{3});
+    defer qemb.deinit();
+    qemb.data[0] = 1.0;
+    qemb.data[1] = 0.0;
+    qemb.data[2] = 0.0;
+    const score = try Ranker.vectorScore(&emb, &qemb);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), score, @as(f32, 0.01));
+}
+
+test "Dot product score" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var emb = try Tensor.init(gpa, &.{3});
+    defer emb.deinit();
+    emb.data[0] = 1.0;
+    emb.data[1] = 2.0;
+    emb.data[2] = 3.0;
+    var qemb = try Tensor.init(gpa, &.{3});
+    defer qemb.deinit();
+    qemb.data[0] = 1.0;
+    qemb.data[1] = 2.0;
+    qemb.data[2] = 3.0;
+    const score = try Ranker.dotProductScore(&emb, &qemb);
+    try testing.expectApproxEqAbs(@as(f32, 14.0), score, @as(f32, 0.01));
+}
+
+test "Weighted average" {
+    const testing = std.testing;
+    const scores = [_]f32{ 0.5, 0.8, 0.3 };
+    const weights = [_]f32{ 1.0, 2.0, 1.0 };
+    const avg = try Ranker.weightedAverage(&scores, &weights);
+    try testing.expect(avg > 0.0 and avg < 1.0);
+}
+
+test "Weighted average rejects negative weights" {
+    const testing = std.testing;
+    const scores = [_]f32{ 0.5, 0.8 };
+    const weights = [_]f32{ 1.0, -0.5 };
+    try testing.expectError(error.InvalidParameter, Ranker.weightedAverage(&scores, &weights));
+}
+
+test "Exponential decay" {
+    const testing = std.testing;
+    var scores = [_]f32{ 1.0, 1.0, 1.0, 1.0 };
+    try Ranker.exponentialDecay(&scores, 0.9);
+    try testing.expect(scores[0] > scores[1]);
+    try testing.expect(scores[1] > scores[2]);
+    try testing.expect(scores[2] > scores[3]);
+}
+
+test "Normalize scores" {
+    const testing = std.testing;
+    var scores = [_]f32{ 10.0, 20.0, 30.0, 40.0 };
+    Ranker.normalizeScoresStatic(&scores);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), scores[0], @as(f32, 0.01));
+    try testing.expectApproxEqAbs(@as(f32, 1.0), scores[3], @as(f32, 0.01));
+}
+
+test "MinHash bitmask signature identical sequences agree" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 128, 42);
+    defer ranker.deinit();
+    const mask1 = try ranker.minHashBitmask(&.{ 5, 6, 7, 8 });
+    defer gpa.free(mask1);
+    const mask2 = try ranker.minHashBitmask(&.{ 5, 6, 7, 8 });
+    defer gpa.free(mask2);
+    const sim = Ranker.jaccardFromBitmasks(mask1, mask2, 128);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), sim, @as(f32, 0.01));
+}
+
+test "MinHash bitmask signature disjoint sequences below one" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 128, 42);
+    defer ranker.deinit();
+    const mask1 = try ranker.minHashBitmask(&.{ 1, 2, 3, 4 });
+    defer gpa.free(mask1);
+    const mask2 = try ranker.minHashBitmask(&.{ 100, 200, 300, 400 });
+    defer gpa.free(mask2);
+    const sim = Ranker.jaccardFromBitmasks(mask1, mask2, 128);
+    try testing.expect(sim < 1.0);
+    try testing.expect(sim >= 0.0);
+}
+
+test "Jaccard signature bitmask correlates with true overlap" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 1, 256, 7);
+    defer ranker.deinit();
+    const sim_high = try ranker.jaccardSignatureBitmask(&.{ 1, 2, 3, 4, 5 }, &.{ 1, 2, 3, 4, 5, 6 });
+    const sim_low = try ranker.jaccardSignatureBitmask(&.{ 1, 2, 3, 4, 5 }, &.{ 50, 60, 70, 80, 90 });
+    try testing.expect(sim_high > sim_low);
+}
+
+test "Content scoring reflects indexed similarity" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 4, 8, 42);
+    defer ranker.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    try ssi.addSequence(&.{ 1, 2, 3, 4, 5 }, 0, true);
+    const matching = try ranker.scoreSequence(&.{ 1, 2, 3 }, &ssi);
+    const unrelated = try ranker.scoreSequence(&.{ 900, 901, 902, 903, 904 }, &ssi);
+    try testing.expect(matching > unrelated);
+    try testing.expect(matching > 0.001);
+}
+
+test "Ngram order above limit rejected" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    try testing.expectError(error.InvalidParameter, Ranker.init(gpa, 65, 8, 42));
+}
+
+test "Model roundtrip preserves weights and params" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 4, 8, 42);
+    defer ranker.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(path);
+    const full = try std.fs.path.join(gpa, &.{ path, "m.bin" });
+    defer gpa.free(full);
+    try ranker.exportModel(full);
+
+    var r2 = try Ranker.init(gpa, 1, 1, 1);
+    defer r2.deinit();
+    try r2.importModel(full);
+    try testing.expectEqual(@as(usize, 4), r2.num_ngrams);
+    try testing.expectEqual(@as(usize, 8), r2.num_hash_functions);
+    try testing.expectEqual(@as(usize, 4), r2.ngram_weights.len);
+    try testing.expectEqual(@as(usize, 16), r2.lsh_hash_params.len);
+    try testing.expectEqual(@as(u64, 42), r2.seed);
+    try testing.expectEqualSlices(f32, ranker.ngram_weights, r2.ngram_weights);
+}
+
+test "ImportModel truncated file errors and preserves state" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var r = try Ranker.init(gpa, 2, 4, 99);
+    defer r.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(path);
+    const full = try std.fs.path.join(gpa, &.{ path, "trunc.bin" });
+    defer gpa.free(full);
+    var bytes = std.ArrayList(u8).init(gpa);
+    defer bytes.deinit();
+    bytes.appendSlice(&[_]u8{2}) catch unreachable;
+    bytes.appendSlice(&mem.toBytes(mem.nativeToLittle(u64, 3))) catch unreachable;
+    bytes.appendSlice(&mem.toBytes(mem.nativeToLittle(u64, 3))) catch unreachable;
+    const w0: u32 = @bitCast(@as(f32, 0.25));
+    const w1: u32 = @bitCast(@as(f32, 0.50));
+    const w2: u32 = @bitCast(@as(f32, 0.75));
+    bytes.appendSlice(&mem.toBytes(mem.nativeToLittle(u32, w0))) catch unreachable;
+    bytes.appendSlice(&mem.toBytes(mem.nativeToLittle(u32, w1))) catch unreachable;
+    bytes.appendSlice(&mem.toBytes(mem.nativeToLittle(u32, w2))) catch unreachable;
+    try tmp.dir.writeFile(.{ .sub_path = "trunc.bin", .data = bytes.items });
+    try testing.expectError(error.EndOfStream, r.importModel(full));
+    try testing.expectEqual(@as(usize, 2), r.num_ngrams);
+    try testing.expectEqual(@as(usize, 4), r.num_hash_functions);
+    try testing.expectEqual(@as(usize, 2), r.ngram_weights.len);
+    try testing.expectEqual(@as(usize, 8), r.lsh_hash_params.len);
+    try testing.expectEqual(@as(u64, 99), r.seed);
+}
+
+test "CalibrateWeights leaves weights unchanged when labels match predictions" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 2, 8, 42);
+    defer ranker.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    try ssi.addSequence(&.{ 1, 2, 3, 4, 5 }, 0, true);
+    const w0_before = ranker.ngram_weights[0];
+    const w1_before = ranker.ngram_weights[1];
+    const pred = try ranker.scoreSequence(&.{ 1, 2, 3 }, &ssi);
+    const data = [_][]const u32{ &.{ 1, 2, 3 } };
+    const labels = [_]f32{pred};
+    try ranker.calibrateWeights(&data, &labels, &ssi, 1);
+    try testing.expectApproxEqAbs(w0_before, ranker.ngram_weights[0], 1e-4);
+    try testing.expectApproxEqAbs(w1_before, ranker.ngram_weights[1], 1e-4);
+}
+
+test "TopKHeap returns at most k results" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 4, 8, 42);
+    defer ranker.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    const out = try ranker.topKHeap(&ssi, &.{1}, 3, gpa);
+    defer {
+        for (out) |*rs| rs.deinit(gpa);
+        gpa.free(out);
+    }
+    try testing.expect(out.len <= 3);
+}
+
+test "StreamingRank returns at most k segments" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 4, 8, 42);
+    defer ranker.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    var bytes = std.ArrayList(u8).init(gpa);
+    defer bytes.deinit();
+    var i: u32 = 0;
+    while (i < 3000) : (i += 1) {
+        const le = mem.toBytes(mem.nativeToLittle(u32, i));
+        bytes.appendSlice(&le) catch unreachable;
+    }
+    var reader = std.io.fixedBufferStream(bytes.items);
+    const out = try ranker.streamingRank(&reader.reader(), &ssi, 4, gpa);
+    defer {
+        for (out) |*rs| rs.deinit(gpa);
+        gpa.free(out);
+    }
+    try testing.expect(out.len <= 4);
+}
+
+test "RankCandidatesWithQuery sorts by combined score" {
+    const testing = std.testing;
+    const gpa = std.testing.allocator;
+    var ranker = try Ranker.init(gpa, 4, 8, 42);
+    defer ranker.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    try ssi.addSequence(&.{ 1, 2, 3, 4, 5 }, 0, true);
+    const c1 = try RankedSegment.init(gpa, @constCast(&[_]u32{ 1, 2, 3 }), 0.0, 0, true);
+    const c2 = try RankedSegment.init(gpa, @constCast(&[_]u32{ 900, 901, 902 }), 0.0, 1, false);
+    var cands = [_]RankedSegment{ c1, c2 };
+    defer {
+        for (&cands) |*c| c.deinit(gpa);
+    }
+    try ranker.rankCandidatesWithQuery(&cands, &.{ 1, 2, 3 }, &ssi, gpa);
+    try testing.expect(cands[0].score >= cands[1].score);
+}
+
+
 
 fn clamp01(x: f64) f64 {
     if (x < 0.0) return 0.0;
@@ -4508,7 +5071,7 @@ pub const RelationalTriplet = struct {
         object: []const u8,
         confidence_in: f64,
     ) !RelationalTriplet {
-        const now_ts = @as(i64, @truncate(std.time.nanoTimestamp()));
+        const now_ns = @as(i64, @truncate(std.time.nanoTimestamp()));
 
         const s = try allocator.dupe(u8, subject);
         errdefer allocator.free(s);
@@ -4523,7 +5086,7 @@ pub const RelationalTriplet = struct {
             .object = o,
             .confidence = clamp01(confidence_in),
             .source_hash = hashTripletIdentity(subject, relation, object),
-            .extraction_time = now_ts,
+            .extraction_time = now_ns,
             .allocator = allocator,
             .metadata = StringHashMap([]u8).init(allocator),
         };
@@ -4641,9 +5204,9 @@ pub const RelationalTriplet = struct {
     }
 
     pub fn toGraphElements(self: *const RelationalTriplet, allocator: Allocator) !struct {
-        subject_node: nsir_core.Node,
-        object_node: nsir_core.Node,
-        edge: nsir_core.Edge,
+        subject_node: Node,
+        object_node: Node,
+        edge: Edge,
     } {
         var subject_id_hash: [32]u8 = undefined;
         Sha256.hash(self.subject, &subject_id_hash, .{});
@@ -4670,7 +5233,7 @@ pub const RelationalTriplet = struct {
         const mod_ns: i128 = @mod(self.extraction_time, period_ns);
         const phase = @as(f64, @floatFromInt(mod_ns)) / @as(f64, @floatFromInt(period_ns)) * std.math.pi * 2.0;
 
-        var subject_node = try nsir_core.Node.initWithComplex(
+        var subject_node = try Node.initWithComplex(
             allocator,
             subject_id_str[0..],
             self.subject,
@@ -4681,7 +5244,7 @@ pub const RelationalTriplet = struct {
         try subject_node.setMetadata("type", "entity");
         try subject_node.setMetadata("role", "subject");
 
-        var object_node = try nsir_core.Node.initWithComplex(
+        var object_node = try Node.initWithComplex(
             allocator,
             object_id_str[0..],
             self.object,
@@ -4692,7 +5255,7 @@ pub const RelationalTriplet = struct {
         try object_node.setMetadata("type", "entity");
         try object_node.setMetadata("role", "object");
 
-        var edge = try nsir_core.Edge.initWithComplex(
+        var edge = try Edge.initWithComplex(
             allocator,
             subject_id_str[0..],
             object_id_str[0..],
@@ -4893,7 +5456,7 @@ pub const KnowledgeGraphIndex = struct {
         return results;
     }
 
-    fn queryMorphemeAware(
+    pub fn queryMorphemeAware(
         self: *KnowledgeGraphIndex,
         subject: ?[]const u8,
         relation: ?[]const u8,
@@ -5242,7 +5805,7 @@ pub const InferenceHook = struct {
 };
 
 pub const CREVPipeline = struct {
-    kernel: *chaos_core.ChaosCoreKernel,
+    kernel: *ChaosCoreKernel,
     triplet_buffer: StreamBuffer,
     knowledge_index: KnowledgeGraphIndex,
     validation_threshold: f64,
@@ -5312,7 +5875,7 @@ pub const CREVPipeline = struct {
         }
     };
 
-    pub fn init(allocator: Allocator, kernel: *chaos_core.ChaosCoreKernel) !CREVPipeline {
+    pub fn init(allocator: Allocator, kernel: *ChaosCoreKernel) !CREVPipeline {
         var pipeline = CREVPipeline{
             .kernel = kernel,
             .triplet_buffer = try StreamBuffer.init(allocator, 10000),
@@ -5756,17 +6319,19 @@ pub const CREVPipeline = struct {
         const subject_known = self.entity_statistics.contains(triplet.subject);
         const object_known = self.entity_statistics.contains(triplet.object);
 
-        if (!subject_known and !object_known) {
-            const w = 0.4;
-            weighted_sum += 1.0 * w;
-            total_weight += w;
-        } else if (!subject_known or !object_known) {
-            const w = 0.2;
-            weighted_sum += 1.0 * w;
-            total_weight += w;
+        if (self.entity_statistics.count() > 0) {
+            if (!subject_known and !object_known) {
+                const w = 0.4;
+                weighted_sum += 1.0 * w;
+                total_weight += w;
+            } else if (!subject_known or !object_known) {
+                const w = 0.2;
+                weighted_sum += 1.0 * w;
+                total_weight += w;
+            }
         }
 
-        if (!self.relation_statistics.contains(triplet.relation)) {
+        if (self.relation_statistics.count() > 0 and !self.relation_statistics.contains(triplet.relation)) {
             const w = 0.15;
             weighted_sum += 1.0 * w;
             total_weight += w;
@@ -5998,10 +6563,511 @@ pub const CREVPipeline = struct {
     }
 };
 
+test "ExtractionStage toString and fromString" {
+    const testing = std.testing;
 
-const EMBED_DIM: usize = 64;
+    try testing.expectEqualStrings("tokenization", ExtractionStage.tokenization.toString());
+    try testing.expectEqualStrings("triplet_extraction", ExtractionStage.triplet_extraction.toString());
+    try testing.expectEqualStrings("validation", ExtractionStage.validation.toString());
+    try testing.expectEqualStrings("integration", ExtractionStage.integration.toString());
+    try testing.expectEqualStrings("indexing", ExtractionStage.indexing.toString());
+
+    try testing.expectEqual(ExtractionStage.tokenization, ExtractionStage.fromString("tokenization").?);
+    try testing.expectEqual(ExtractionStage.validation, ExtractionStage.fromString("validation").?);
+    try testing.expect(ExtractionStage.fromString("invalid") == null);
+}
+
+test "ExtractionStage next" {
+    const testing = std.testing;
+
+    try testing.expectEqual(ExtractionStage.triplet_extraction, ExtractionStage.tokenization.next().?);
+    try testing.expectEqual(ExtractionStage.validation, ExtractionStage.triplet_extraction.next().?);
+    try testing.expectEqual(ExtractionStage.integration, ExtractionStage.validation.next().?);
+    try testing.expectEqual(ExtractionStage.indexing, ExtractionStage.integration.next().?);
+    try testing.expect(ExtractionStage.indexing.next() == null);
+}
+
+test "RelationalTriplet initialization" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var triplet = try RelationalTriplet.init(allocator, "Alice", "knows", "Bob", 0.9);
+    defer triplet.deinit();
+
+    try testing.expectEqualStrings("Alice", triplet.subject);
+    try testing.expectEqualStrings("knows", triplet.relation);
+    try testing.expectEqualStrings("Bob", triplet.object);
+    try testing.expectApproxEqAbs(@as(f64, 0.9), triplet.confidence, 0.001);
+}
+
+test "RelationalTriplet clone" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var original = try RelationalTriplet.init(allocator, "Paris", "is_a", "City", 0.95);
+    defer original.deinit();
+
+    try original.setMetadata("source", "test");
+
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit();
+
+    try testing.expectEqualStrings(original.subject, cloned.subject);
+    try testing.expectEqualStrings(original.relation, cloned.relation);
+    try testing.expectEqualStrings(original.object, cloned.object);
+    try testing.expectApproxEqAbs(original.confidence, cloned.confidence, 0.001);
+    try testing.expectEqualStrings("test", cloned.getMetadata("source").?);
+}
+
+test "RelationalTriplet computeHash" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var triplet1 = try RelationalTriplet.init(allocator, "A", "B", "C", 0.5);
+    defer triplet1.deinit();
+
+    var triplet2 = try RelationalTriplet.init(allocator, "A", "B", "C", 0.5);
+    defer triplet2.deinit();
+
+    const hash1 = triplet1.computeHash();
+    const hash2 = triplet2.computeHash();
+
+    try testing.expect(hash1.len == 32);
+    try testing.expect(hash2.len == 32);
+}
+
+test "RelationalTriplet equals" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var triplet1 = try RelationalTriplet.init(allocator, "A", "rel", "B", 0.9);
+    defer triplet1.deinit();
+
+    var triplet2 = try RelationalTriplet.init(allocator, "A", "rel", "B", 0.8);
+    defer triplet2.deinit();
+
+    var triplet3 = try RelationalTriplet.init(allocator, "A", "different", "B", 0.9);
+    defer triplet3.deinit();
+
+    try testing.expect(triplet1.equals(&triplet2));
+    try testing.expect(!triplet1.equals(&triplet3));
+}
+
+test "KnowledgeGraphIndex initialization and indexing" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var index = KnowledgeGraphIndex.init(allocator);
+    defer index.deinit();
+
+    const triplet = try allocator.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(allocator, "Entity1", "related_to", "Entity2", 0.8);
+
+    try index.index(triplet);
+
+    try testing.expectEqual(@as(usize, 1), index.count());
+}
+
+test "KnowledgeGraphIndex query" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var index = KnowledgeGraphIndex.init(allocator);
+    defer index.deinit();
+
+    const triplet1 = try allocator.create(RelationalTriplet);
+    triplet1.* = try RelationalTriplet.init(allocator, "Alice", "knows", "Bob", 0.9);
+    try index.index(triplet1);
+
+    const triplet2 = try allocator.create(RelationalTriplet);
+    triplet2.* = try RelationalTriplet.init(allocator, "Alice", "works_at", "Company", 0.85);
+    try index.index(triplet2);
+
+    var results = try index.query("Alice", null, null, allocator);
+    defer results.deinit();
+
+    try testing.expectEqual(@as(usize, 2), results.items.len);
+}
+
+test "KnowledgeGraphIndex queryBySubject" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var index = KnowledgeGraphIndex.init(allocator);
+    defer index.deinit();
+
+    const triplet = try allocator.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(allocator, "TestSubject", "has", "TestObject", 0.7);
+    try index.index(triplet);
+
+    const results = index.queryBySubject("TestSubject");
+    try testing.expectEqual(@as(usize, 1), results.len);
+
+    const empty_results = index.queryBySubject("NonExistent");
+    try testing.expectEqual(@as(usize, 0), empty_results.len);
+}
+
+test "KnowledgeGraphIndex remove" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var index = KnowledgeGraphIndex.init(allocator);
+    defer index.deinit();
+
+    const triplet = try allocator.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(allocator, "ToRemove", "relation", "Target", 0.6);
+    try index.index(triplet);
+
+    try testing.expectEqual(@as(usize, 1), index.count());
+
+    const removed = index.remove(triplet);
+    try testing.expect(removed);
+    try testing.expectEqual(@as(usize, 0), index.count());
+
+    triplet.deinit();
+    allocator.destroy(triplet);
+}
+
+test "StreamBuffer push and pop" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var buffer = try StreamBuffer.init(allocator, 5);
+    defer buffer.deinit();
+
+    try testing.expect(buffer.isEmpty());
+    try testing.expect(!buffer.isFull());
+
+    const triplet1 = try allocator.create(RelationalTriplet);
+    triplet1.* = try RelationalTriplet.init(allocator, "A", "B", "C", 0.5);
+    const ok = buffer.push(triplet1);
+    try testing.expect(ok);
+
+    try testing.expect(!buffer.isEmpty());
+    try testing.expectEqual(@as(usize, 1), buffer.getSize());
+
+    const popped = buffer.pop();
+    try testing.expect(popped != null);
+    try testing.expectEqualStrings("A", popped.?.subject);
+    try testing.expect(buffer.isEmpty());
+
+    popped.?.deinit();
+    allocator.destroy(popped.?);
+}
+
+test "StreamBuffer capacity" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var buffer = try StreamBuffer.init(allocator, 3);
+    defer buffer.deinit();
+
+    const triplet1 = try allocator.create(RelationalTriplet);
+    triplet1.* = try RelationalTriplet.init(allocator, "1", "r", "a", 0.5);
+    try testing.expect(buffer.push(triplet1));
+
+    const triplet2 = try allocator.create(RelationalTriplet);
+    triplet2.* = try RelationalTriplet.init(allocator, "2", "r", "b", 0.5);
+    try testing.expect(buffer.push(triplet2));
+
+    const triplet3 = try allocator.create(RelationalTriplet);
+    triplet3.* = try RelationalTriplet.init(allocator, "3", "r", "c", 0.5);
+    try testing.expect(buffer.push(triplet3));
+
+    try testing.expect(buffer.isFull());
+
+    const triplet4 = try allocator.create(RelationalTriplet);
+    triplet4.* = try RelationalTriplet.init(allocator, "4", "r", "d", 0.5);
+    const success = buffer.push(triplet4);
+    try testing.expect(!success);
+    try testing.expectEqual(@as(usize, 1), buffer.overflow_count);
+
+    triplet4.deinit();
+    allocator.destroy(triplet4);
+
+    while (buffer.pop()) |t| {
+        t.deinit();
+        allocator.destroy(t);
+    }
+}
+
+test "StreamBuffer peek" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var buffer = try StreamBuffer.init(allocator, 5);
+    defer buffer.deinit();
+
+    try testing.expect(buffer.peek() == null);
+
+    const triplet = try allocator.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(allocator, "Peek", "test", "value", 0.7);
+    try testing.expect(buffer.push(triplet));
+
+    const peeked = buffer.peek();
+    try testing.expect(peeked != null);
+    try testing.expectEqualStrings("Peek", peeked.?.subject);
+    try testing.expectEqual(@as(usize, 1), buffer.getSize());
+
+    const popped = buffer.pop().?;
+    popped.deinit();
+    allocator.destroy(popped);
+}
+
+test "PipelineResult merge" {
+    const testing = std.testing;
+
+    var result1 = PipelineResult.init();
+    result1.triplets_extracted = 10;
+    result1.triplets_validated = 8;
+    result1.triplets_integrated = 7;
+
+    var result2 = PipelineResult.init();
+    result2.triplets_extracted = 5;
+    result2.triplets_validated = 4;
+    result2.triplets_integrated = 3;
+
+    result1.merge(result2);
+
+    try testing.expectEqual(@as(usize, 15), result1.triplets_extracted);
+    try testing.expectEqual(@as(usize, 12), result1.triplets_validated);
+    try testing.expectEqual(@as(usize, 10), result1.triplets_integrated);
+}
+
+test "CREVPipeline initialization" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    try testing.expect(pipeline.is_running);
+    try testing.expectEqual(@as(usize, 0), pipeline.extraction_count);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), pipeline.validation_threshold, 0.001);
+}
+
+test "CREVPipeline extractTriplets" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    const text = "Paris is a city. The Eiffel Tower is located in Paris.";
+    var triplets = try pipeline.extractTriplets(text);
+    defer {
+        for (triplets.items) |triplet| {
+            triplet.deinit();
+            allocator.destroy(triplet);
+        }
+        triplets.deinit();
+    }
+
+    try testing.expect(triplets.items.len > 0);
+}
+
+test "CREVPipeline processTextStream" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    const text = "Python is a programming language. Python has modules.";
+    const result = try pipeline.processTextStream(text);
+
+    try testing.expect(result.triplets_extracted > 0);
+    try testing.expect(result.processing_time_ns >= 0);
+}
+
+test "CREVPipeline processStructuredDataStream" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    const data = "Alice,knows,Bob,0.9\nBob,works_at,Company,0.85";
+    const result = try pipeline.processStructuredDataStream(data);
+
+    try testing.expect(result.triplets_extracted == 2);
+}
+
+test "CREVPipeline validateTriplet" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    pipeline.setValidationThreshold(0.4);
+
+    const triplet = try allocator.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(allocator, "TestSubjectEntity", "is_a", "TestObjectEntity", 0.95);
+    defer {
+        triplet.deinit();
+        allocator.destroy(triplet);
+    }
+
+    var result = try pipeline.validateTriplet(triplet);
+    defer result.deinit();
+
+    try testing.expect(result.confidence_adjusted > 0);
+}
+
+test "CREVPipeline checkConsistency" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    var triplet1 = try RelationalTriplet.init(allocator, "A", "is_a", "B", 0.9);
+    defer triplet1.deinit();
+
+    var triplet2 = try RelationalTriplet.init(allocator, "A", "is_a", "B", 0.8);
+    defer triplet2.deinit();
+
+    try testing.expect(pipeline.checkConsistency(&triplet1, &triplet2));
+
+    var triplet3 = try RelationalTriplet.init(allocator, "A", "is_not", "B", 0.7);
+    defer triplet3.deinit();
+
+    try testing.expect(!pipeline.checkConsistency(&triplet1, &triplet3));
+}
+
+test "CREVPipeline getPipelineStatistics" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    const stats = pipeline.getPipelineStatistics();
+
+    try testing.expectEqual(@as(usize, 0), stats.total_extractions);
+    try testing.expectEqual(@as(usize, 0), stats.total_validations);
+    try testing.expect(stats.uptime_ms >= 0);
+}
+
+test "CREVPipeline queryKnowledgeGraph" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    const triplet = try allocator.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(allocator, "DirectEntity", "has_property", "TestProperty", 0.9);
+    try pipeline.knowledge_index.index(triplet);
+
+    var results = try pipeline.queryKnowledgeGraph("DirectEntity", null, null);
+    defer results.deinit();
+
+    try testing.expect(results.items.len > 0);
+}
+
+test "CREVPipeline shutdown" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+
+    var pipeline = try CREVPipeline.init(allocator, &kernel);
+    defer pipeline.deinit();
+
+    try testing.expect(pipeline.isRunning());
+    pipeline.shutdown();
+    try testing.expect(!pipeline.isRunning());
+}
+
+test "ValidationResult initialization" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var triplet = try RelationalTriplet.init(allocator, "S", "R", "O", 0.75);
+    defer triplet.deinit();
+
+    var result = ValidationResult.init(allocator, &triplet);
+    defer result.deinit();
+
+    try testing.expect(result.is_valid);
+    try testing.expect(!result.hasConflicts());
+    try testing.expectEqual(@as(usize, 0), result.conflictCount());
+}
+
+test "RelationStatistics update" {
+    const testing = std.testing;
+
+    var stats = CREVPipeline.RelationStatistics.init();
+
+    stats.update(0.8);
+    try testing.expectEqual(@as(usize, 1), stats.count);
+    try testing.expectApproxEqAbs(@as(f64, 0.8), stats.avg_confidence, 0.001);
+
+    stats.update(0.6);
+    try testing.expectEqual(@as(usize, 2), stats.count);
+    try testing.expectApproxEqAbs(@as(f64, 0.7), stats.avg_confidence, 0.001);
+
+    try testing.expect(stats.getVariance() >= 0);
+    try testing.expect(stats.getStdDev() >= 0);
+}
+
+test "StreamBuffer utilization" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var buffer = try StreamBuffer.init(allocator, 10);
+    defer buffer.deinit();
+
+    try testing.expectApproxEqAbs(@as(f64, 0.0), buffer.getUtilization(), 0.001);
+
+    const triplet1 = try allocator.create(RelationalTriplet);
+    triplet1.* = try RelationalTriplet.init(allocator, "1", "r", "a", 0.5);
+    try testing.expect(buffer.push(triplet1));
+
+    const triplet2 = try allocator.create(RelationalTriplet);
+    triplet2.* = try RelationalTriplet.init(allocator, "2", "r", "b", 0.5);
+    try testing.expect(buffer.push(triplet2));
+
+    try testing.expectApproxEqAbs(@as(f64, 0.2), buffer.getUtilization(), 0.001);
+
+    while (buffer.pop()) |t| {
+        t.deinit();
+        allocator.destroy(t);
+    }
+}
+
+
 const COG_K: usize = 4;
 const COG_H: usize = 16;
+const ROUTE_TOP_K: usize = 64;
+const SKILL_NUMERIC_SEED: u64 = 0x5EEDF00D5EEDF00D;
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ROW: c_int = 100;
@@ -6493,7 +7559,9 @@ const Database = struct {
             const rc = sqlite3_step(stmt);
             try self.checkStep(rc);
             if (rc == SQLITE_DONE) break;
-            try list.append(try self.columnText(stmt, 0));
+            const id = try self.columnText(stmt, 0);
+            errdefer self.allocator.free(id);
+            try list.append(id);
         }
         return list.toOwnedSlice();
     }
@@ -6657,7 +7725,7 @@ const Database = struct {
         return state_json;
     }
 
-    fn upsertStateKey(self: *Database, run_id: []const u8, key: []const u8, value_json: []const u8) !void {
+    fn setRunStateKey(self: *Database, run_id: []const u8, key: []const u8, value_json: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const stmt = try self.prepareUnlocked("INSERT INTO run_state(run_id,key,value_json,updated_at) VALUES(?,?,?,?) ON CONFLICT(run_id,key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at;");
@@ -6884,13 +7952,25 @@ const Database = struct {
             const rc = sqlite3_step(stmt);
             try self.checkStep(rc);
             if (rc == SQLITE_DONE) break;
+            const id = try self.columnText(stmt, 0);
+            errdefer self.allocator.free(id);
+            const name = try self.columnText(stmt, 1);
+            errdefer self.allocator.free(name);
+            const description = try self.columnText(stmt, 2);
+            errdefer self.allocator.free(description);
+            const trigger_json = try self.columnText(stmt, 3);
+            errdefer self.allocator.free(trigger_json);
+            const procedure_json = try self.columnText(stmt, 4);
+            errdefer self.allocator.free(procedure_json);
+            const embedding_json = try self.columnText(stmt, 5);
+            errdefer self.allocator.free(embedding_json);
             try list.append(SkillRecord{
-                .id = try self.columnText(stmt, 0),
-                .name = try self.columnText(stmt, 1),
-                .description = try self.columnText(stmt, 2),
-                .trigger_json = try self.columnText(stmt, 3),
-                .procedure_json = try self.columnText(stmt, 4),
-                .embedding_json = try self.columnText(stmt, 5),
+                .id = id,
+                .name = name,
+                .description = description,
+                .trigger_json = trigger_json,
+                .procedure_json = procedure_json,
+                .embedding_json = embedding_json,
                 .vector_score = 0,
                 .sparse_rank = std.math.maxInt(usize),
                 .rrf_score = 0,
@@ -6915,19 +7995,14 @@ const Database = struct {
             const rc = sqlite3_step(stmt);
             try self.checkStep(rc);
             if (rc == SQLITE_DONE) break;
-            try ids.append(try self.columnText(stmt, 0));
+            const id = try self.columnText(stmt, 0);
+            errdefer self.allocator.free(id);
+            try ids.append(id);
         }
         return ids.toOwnedSlice();
     }
 
-    fn addSkillFromFields(self: *Database, app: *App, tenant_id: []const u8, id: []const u8, name: []const u8, description: []const u8, trigger_json: []const u8, procedure_json: []const u8, enabled: bool) !void {
-        var vector: [EMBED_DIM]f64 = undefined;
-        var combined = std.ArrayList(u8).init(self.allocator);
-        defer combined.deinit();
-        try combined.writer().print("{s}\n{s}\n{s}", .{ name, description, procedure_json });
-        embedText(combined.items, &vector);
-        const embedding_json = try embeddingToJson(self.allocator, &vector);
-        defer self.allocator.free(embedding_json);
+    fn addSkillFromFields(self: *Database, tenant_id: []const u8, id: []const u8, name: []const u8, description: []const u8, trigger_json: []const u8, procedure_json: []const u8, tokens_json: []const u8, enabled: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.execUnlocked("BEGIN IMMEDIATE;");
@@ -6941,7 +8016,7 @@ const Database = struct {
         try self.bindText(stmt, 4, description);
         try self.bindText(stmt, 5, trigger_json);
         try self.bindText(stmt, 6, procedure_json);
-        try self.bindText(stmt, 7, embedding_json);
+        try self.bindText(stmt, 7, tokens_json);
         try self.bindInt64(stmt, 8, 1);
         try self.bindInt(stmt, 9, if (enabled) 1 else 0);
         try self.bindInt64(stmt, 10, now());
@@ -6960,7 +8035,6 @@ const Database = struct {
         try self.checkStep(sqlite3_step(fstmt));
         try self.execUnlocked("COMMIT;");
         committed = true;
-        try indexSkill(app, id, name, description, trigger_json, procedure_json, enabled);
     }
 
     fn incrementTokenUsage(self: *Database, run_id: []const u8, amount: i64) !void {
@@ -7081,13 +8155,13 @@ const App = struct {
     config: Config,
     db: *Database,
     fs_mutex: std.Thread.Mutex,
-    crev_mutex: std.Thread.Mutex,
-    tokenizer: MGT,
-    ssindex: SSI,
+    retrieval_mutex: std.Thread.Mutex,
+    graph_mutex: std.Thread.Mutex,
+    mgt: MGT,
+    ssi: SSI,
     ranker: Ranker,
-    kernel: chaos_core.ChaosCoreKernel,
-    crev: *CREVPipeline,
-    pos_to_skill_id: std.AutoHashMap(u64, []u8),
+    kernel: ChaosCoreKernel,
+    crev: CREVPipeline,
 };
 
 const ExprEval = struct {
@@ -7234,48 +8308,125 @@ const ExprEval = struct {
 };
 
 pub fn main() !void {
-        var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-        var config = try Config.load(allocator);
-        defer config.deinit(allocator);
-        try std.fs.cwd().makePath(config.workspace_root);
-        try std.fs.cwd().makePath(config.knowledge_root);
-            var db = try Database.open(allocator, config.database_path);
-        defer db.close();
-        try db.initSchema();
-        try db.ensureTenant(config.default_tenant_id);
-            var app = App{
+    var config = try Config.load(allocator);
+    defer config.deinit(allocator);
+    try std.fs.cwd().makePath(config.workspace_root);
+    try std.fs.cwd().makePath(config.knowledge_root);
+    var db = try Database.open(allocator, config.database_path);
+    defer db.close();
+    try db.initSchema();
+    try db.ensureTenant(config.default_tenant_id);
+    var mgt = try MGT.init(allocator, SEED_VOCABULARY, SEED_ANCHORS, null, .dual);
+    defer mgt.deinit();
+    var ssi = SSI.init(allocator);
+    defer ssi.deinit();
+    var ranker = try Ranker.init(allocator, 4, 256, 0xA637200C4F12B551);
+    defer ranker.deinit();
+    var kernel = ChaosCoreKernel.init(allocator);
+    defer kernel.deinit();
+    var crev = try CREVPipeline.init(allocator, &kernel);
+    defer crev.deinit();
+    var app = App{
         .allocator = allocator,
         .config = config,
         .db = &db,
         .fs_mutex = .{},
-        .crev_mutex = .{},
-        .tokenizer = try MGT.init(allocator, &[_][]const u8{}, &[_][]const u8{}, null, .english),
-        .ssindex = SSI.init(allocator),
-        .ranker = try Ranker.init(allocator, 2, 4, 0x9E3779B97F4A7C15),
-        .kernel = chaos_core.ChaosCoreKernel.init(allocator),
-        .crev = undefined,
-        .pos_to_skill_id = std.AutoHashMap(u64, []u8).init(allocator),
+        .retrieval_mutex = .{},
+        .graph_mutex = .{},
+        .mgt = mgt,
+        .ssi = ssi,
+        .ranker = ranker,
+        .kernel = kernel,
+        .crev = crev,
     };
-    {
-        const crev_ptr = try allocator.create(CREVPipeline);
-        crev_ptr.* = try CREVPipeline.init(allocator, &app.kernel);
-        app.crev = crev_ptr;
-    }
-        try seedInitialSkills(&app);
-        try rebuildSkillIndex(&app);
-            try resumeActiveRuns(&app);
-        const meta_thread = try std.Thread.spawn(.{}, metaHarnessEntry, .{&app});
+    try seedInitialSkills(&app);
+    try indexAllEnabledSkills(&app);
+    try resumeActiveRuns(&app);
+    const meta_thread = try std.Thread.spawn(.{}, metaHarnessEntry, .{&app});
     meta_thread.detach();
     try startHttpServer(&app);
 }
 
+const SEED_VOCABULARY: []const []const u8 = &.{
+    "the",   "and",    "with",   "into",    "from",    "this",    "that",    "when",
+    "where", "what",   "which",  "while",   "goal",    "task",    "state",   "step",
+    "plan",  "planning", "execute", "executing", "verify", "verified", "finish", "done",
+    "skill", "skills", "memory", "search",  "append",  "file",    "files",   "line",
+    "lines", "unique", "log",    "logging", "write",   "read",    "check",   "compute",
+    "result", "result", "number", "numeric", "arithmetic", "expression", "constraint", "constraints",
+    "subgoal", "subgoals", "split", "record", "update", "status", "progress", "blocker",
+    "blockers", "fact", "facts", "agent",  "runtime", "procedure", "trigger", "description",
+    "work",  "working", "workspace", "knowledge", "query", "observation", "action", "error",
+    "goal",  "decomposition", "verification", "hallucination", "duplicates", "duplicate", "cél", "feladat",
+    "állapot", "lépés", "terv", "végrehajtás", "ellenőrzés", "kész", "képesség", "memória",
+};
+
+const SEED_ANCHORS: []const []const u8 = &.{
+    "goal", "finish", "done", "verify", "plan",
+};
+
 fn seedInitialSkills(app: *App) !void {
     const tenant_id = app.config.default_tenant_id;
-    try app.db.addSkillFromFields(app, tenant_id, "skill_decompose_goal", "Goal Decomposition", "When status is planning or subgoals list is empty", "{\"trigger\":\"planning\"}", "{\"procedure\":\"1. Split goal into 3-7 subgoals. 2. Record constraints. 3. Update status to executing.\"}", true);
-    try app.db.addSkillFromFields(app, tenant_id, "skill_append_unique_log", "Append Unique Log Line", "When logging without duplicates", "{\"trigger\":\"log\"}", "{\"procedure\":\"1. Use filesystem.append_file with unique true. 2. Verify lines appended.\"}", true);
-    try app.db.addSkillFromFields(app, tenant_id, "skill_numeric_verification", "Numeric Verification", "When computing closed form arithmetic without hallucination", "{\"trigger\":\"arithmetic\"}", "{\"procedure\":\"1. Formulate mathematical expression. 2. Call compute tool. 3. Record verified result into facts.\"}", true);
+    try registerSkill(app, tenant_id, "skill_decompose_goal", "Goal Decomposition", "When status is planning or subgoals list is empty", "{\"trigger\":\"planning\"}", "{\"procedure\":\"1. Split goal into 3-7 subgoals. 2. Record constraints. 3. Update status to executing.\"}", true);
+    try registerSkill(app, tenant_id, "skill_append_unique_log", "Append Unique Log Line", "When logging without duplicates", "{\"trigger\":\"log\"}", "{\"procedure\":\"1. Use filesystem.append_file with unique true. 2. Verify lines appended.\"}", true);
+    try registerSkill(app, tenant_id, "skill_numeric_verification", "Numeric Verification", "When computing closed form arithmetic without hallucination", "{\"trigger\":\"arithmetic\"}", "{\"procedure\":\"1. Formulate mathematical expression. 2. Call compute tool. 3. Record verified result into facts.\"}", true);
+}
+
+fn skillNumericId(skill_id: []const u8) u64 {
+    return stableHash(skill_id, SKILL_NUMERIC_SEED);
+}
+
+fn encodeSkillTokens(app: *App, name: []const u8, description: []const u8, trigger_json: []const u8, procedure_json: []const u8) ![]u32 {
+    var combined = std.ArrayList(u8).init(app.allocator);
+    defer combined.deinit();
+    try combined.writer().print("{s}\n{s}\n{s}\n{s}", .{ name, description, trigger_json, procedure_json });
+    var tokens = std.ArrayList(u32).init(app.allocator);
+    errdefer tokens.deinit();
+    app.retrieval_mutex.lock();
+    defer app.retrieval_mutex.unlock();
+    try app.mgt.encode(combined.items, &tokens);
+    return tokens.toOwnedSlice();
+}
+
+fn tokensToJson(allocator: Allocator, tokens: []const u32) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("[");
+    for (tokens, 0..) |token, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.print("{}", .{token});
+    }
+    try w.writeAll("]");
+    return out.toOwnedSlice();
+}
+
+fn registerSkill(app: *App, tenant_id: []const u8, skill_id: []const u8, name: []const u8, description: []const u8, trigger_json: []const u8, procedure_json: []const u8, enabled: bool) !void {
+    const tokens = try encodeSkillTokens(app, name, description, trigger_json, procedure_json);
+    defer app.allocator.free(tokens);
+    const tokens_json = try tokensToJson(app.allocator, tokens);
+    defer app.allocator.free(tokens_json);
+    try app.db.addSkillFromFields(tenant_id, skill_id, name, description, trigger_json, procedure_json, tokens_json, enabled);
+    if (enabled) {
+        app.retrieval_mutex.lock();
+        defer app.retrieval_mutex.unlock();
+        try app.ssi.addSequence(tokens, skillNumericId(skill_id), true);
+    }
+}
+
+fn indexAllEnabledSkills(app: *App) !void {
+    const skills = try app.db.loadEnabledSkills(app.config.default_tenant_id);
+    defer freeSkillRecords(app.allocator, skills);
+    for (skills) |skill| {
+        const tokens = try encodeSkillTokens(app, skill.name, skill.description, skill.trigger_json, skill.procedure_json);
+        defer app.allocator.free(tokens);
+        app.retrieval_mutex.lock();
+        try app.ssi.addSequence(tokens, skillNumericId(skill.id), true);
+        app.retrieval_mutex.unlock();
+    }
 }
 
 fn resumeActiveRuns(app: *App) !void {
@@ -7299,10 +8450,14 @@ fn spawnRun(app: *App, run_id: []const u8) !void {
 fn system2Entry(app: *App, run_id: []u8) void {
     defer app.allocator.free(run_id);
     runSystem2(app, run_id) catch |err| {
-        var buf: [256]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        _ = fbs.writer().print("{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch {};
-        app.db.markRunStatus(run_id, "failed", fbs.getWritten()) catch {};
+        var err_json: []const u8 = "{\"error\":\"system2\"}";
+        var err_json_owned = false;
+        if (std.fmt.allocPrint(app.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)})) |allocated| {
+            err_json = allocated;
+            err_json_owned = true;
+        } else |_| {}
+        app.db.markRunStatus(run_id, "failed", err_json) catch {};
+        if (err_json_owned) app.allocator.free(err_json);
     };
     finalizeTrajectory(app, run_id) catch {};
 }
@@ -7312,7 +8467,7 @@ fn system1Entry(app: *App, run_id: []u8) void {
     runSystem1(app, run_id) catch |err| {
         const err_json = std.fmt.allocPrint(app.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch return;
         defer app.allocator.free(err_json);
-        _ = app.db.insertEvent(app.config.default_tenant_id, run_id, 0, "system1_error", err_json) catch 0;
+        _ = app.db.insertEvent(app.config.default_tenant_id, run_id, 0, "system1_error", err_json) catch {};
     };
 }
 
@@ -7339,7 +8494,6 @@ fn runSystem2(app: *App, run_id: []const u8) !void {
         if (initial_state.len > app.config.max_state_bytes) return error.StateTooLarge;
         const observation = try app.db.takeObservation(run_id);
         defer app.allocator.free(observation);
-        processObservationForFacts(app, run_id, observation) catch {};
         const skills = try routeSkills(app, run.tenant_id, initial_state, observation);
         defer freeSkillRecords(app.allocator, skills);
         const skills_json = try selectedSkillsJson(app.allocator, skills);
@@ -7348,7 +8502,7 @@ fn runSystem2(app: *App, run_id: []const u8) !void {
         defer app.allocator.free(prompt);
         if (prompt.len > app.config.max_prompt_bytes) return error.PromptTooLarge;
 
-        const frame = try buildCognitionFrame(app.allocator, initial_state, observation, run.step);
+        const frame = try buildCognitionFrame(app, initial_state, observation, run.step);
         defer app.allocator.free(frame);
         try app.db.insertCognitionFrame(run_id, run.step, frame);
 
@@ -7379,11 +8533,6 @@ fn runSystem2(app: *App, run_id: []const u8) !void {
         const post_state = try app.db.applyPatchAndCheckpoint(run_id, next_step, envelope.patch_json, observation, envelope.action_json, app.config.max_state_bytes);
         defer app.allocator.free(post_state);
 
-        if (envelope.terminal) {
-            try app.db.markCompleted(run_id, envelope.patch_json);
-            break;
-        }
-
         const action_id = try app.db.enqueueAction(run_id, next_step, envelope.action_json);
         const outcome = try waitActionOutcome(app, action_id, 600000);
         defer app.allocator.free(outcome);
@@ -7393,10 +8542,16 @@ fn runSystem2(app: *App, run_id: []const u8) !void {
         const verifier = try evaluateStepVerifier(app.allocator, post_action_state, outcome);
         defer app.allocator.free(verifier);
 
-        processObservationForFacts(app, run_id, outcome) catch {};
-
         try app.db.addRawTrace(run.tenant_id, run_id, next_step, initial_state, skills_json, observation, envelope.envelope_json, envelope.patch_json, envelope.action_json, outcome, post_action_state, verifier);
         _ = try app.db.insertEvent(run.tenant_id, run_id, next_step, "step_completed", outcome);
+
+        if (envelope.terminal) {
+            const terminal_result = try std.fmt.allocPrint(app.allocator, "{{\"terminal\":true,\"confidence\":{d},\"step\":{},\"action\":{s}}}", .{ envelope.confidence, next_step, envelope.action_json });
+            defer app.allocator.free(terminal_result);
+            try app.db.markCompleted(run_id, terminal_result);
+            _ = try app.db.insertEvent(run.tenant_id, run_id, next_step, "terminal_envelope", terminal_result);
+            break;
+        }
 
         const status = try app.db.getRunStatus(run_id);
         defer app.allocator.free(status);
@@ -7433,170 +8588,134 @@ fn waitActionOutcome(app: *App, action_id: i64, timeout_ms: i64) ![]u8 {
     return error.ActionTimeout;
 }
 
-fn indexSkill(app: *App, id: []const u8, name: []const u8, description: []const u8, trigger_json: []const u8, procedure_json: []const u8, enabled: bool) !void {
-    if (!enabled) return;
-    var combined = std.ArrayList(u8).init(app.allocator);
-    defer combined.deinit();
-    try combined.writer().print("{s}\n{s}\n{s}\n{s}", .{ name, description, trigger_json, procedure_json });
-    var tokens = std.ArrayList(u32).init(app.allocator);
-    defer tokens.deinit();
-    try app.tokenizer.encode(combined.items, &tokens);
-    if (tokens.items.len == 0) return;
-    const pos = stableHash(id, 0x9E3779B97F4A7C15);
-    try app.ssindex.addSequence(tokens.items, pos, true);
-    const gop = try app.pos_to_skill_id.getOrPut(pos);
-    if (gop.found_existing) {
-        app.allocator.free(gop.value_ptr.*);
-    }
-    gop.value_ptr.* = try app.allocator.dupe(u8, id);
-}
-
-fn rebuildSkillIndex(app: *App) !void {
-    const skills = try app.db.loadEnabledSkills(app.config.default_tenant_id);
-    defer freeSkillRecords(app.allocator, skills);
-    for (skills) |skill| {
-        try indexSkill(app, skill.id, skill.name, skill.description, skill.trigger_json, skill.procedure_json, true);
-    }
-}
-
-fn processObservationForFacts(app: *App, run_id: []const u8, text: []const u8) !void {
-    if (text.len == 0) return;
-    app.crev_mutex.lock();
-    defer app.crev_mutex.unlock();
-    _ = try app.crev.processTextStream(text);
-    try refreshFactsState(app, run_id);
-}
-
-fn refreshFactsState(app: *App, run_id: []const u8) !void {
-    var out = std.ArrayList(u8).init(app.allocator);
-    defer out.deinit();
-    const w = out.writer();
-    try w.writeAll("[");
-    const trips = app.crev.knowledge_index.all_triplets.items;
-    for (trips, 0..) |t, i| {
-        if (i != 0) try w.writeAll(",");
-        try w.writeAll("{\"subject\":");
-        try writeJsonString(w, t.subject);
-        try w.writeAll(",\"relation\":");
-        try writeJsonString(w, t.relation);
-        try w.writeAll(",\"object\":");
-        try writeJsonString(w, t.object);
-        try w.print(",\"confidence\":{}}}", .{t.confidence});
-    }
-    try w.writeAll("]");
-    const facts_json = try out.toOwnedSlice();
-    defer app.allocator.free(facts_json);
-    try app.db.upsertStateKey(run_id, "facts", facts_json);
-}
-
-
 fn routeSkills(app: *App, tenant_id: []const u8, state_json: []const u8, observation_json: []const u8) ![]SkillRecord {
-    var query_builder = std.ArrayList(u8).init(app.allocator);
+    const allocator = app.allocator;
+    var query_builder = std.ArrayList(u8).init(allocator);
     defer query_builder.deinit();
     try query_builder.writer().print("{s}\n{s}", .{ state_json, observation_json });
 
-    const skills = try app.db.loadEnabledSkills(tenant_id);
-    errdefer freeSkillRecords(app.allocator, skills);
-
-    var query_tokens = std.ArrayList(u32).init(app.allocator);
+    var query_tokens = std.ArrayList(u32).init(allocator);
     defer query_tokens.deinit();
-    try app.tokenizer.encode(query_builder.items, &query_tokens);
 
-    const fts_query = try makeFtsQuery(app.allocator, query_builder.items);
-    defer app.allocator.free(fts_query);
-    var fts_ids: [][]u8 = &[_][]u8{};
-    var fts_owned = false;
-    if (fts_query.len > 0) {
-        fts_ids = app.db.searchSkillFtsIds(tenant_id, fts_query) catch blk: {
-            break :blk try app.allocator.alloc([]u8, 0);
-        };
-        fts_owned = true;
+    var candidates: []RankedSegment = try allocator.alloc(RankedSegment, 0);
+    var candidates_owned = true;
+    defer {
+        if (candidates_owned) {
+            freeRankedSegments(candidates, allocator);
+        }
     }
-    defer if (fts_owned) {
-        for (fts_ids) |id| app.allocator.free(id);
-        app.allocator.free(fts_ids);
-    };
 
-    const ranked = try app.ssindex.retrieveTopK(query_tokens.items, @min(@as(usize, 48), skills.len + 1), app.allocator);
-    defer freeRankedSegments(ranked, app.allocator);
-    try app.ranker.rankCandidatesWithQuery(ranked, query_tokens.items, &app.ssindex, app.allocator);
+    var fts_ids: [][]u8 = try allocator.alloc([]u8, 0);
+    var fts_owned = true;
+    defer {
+        if (fts_owned) {
+            for (fts_ids) |id| allocator.free(id);
+            allocator.free(fts_ids);
+        }
+    }
 
-    var selected = std.ArrayList(SkillRecord).init(app.allocator);
+    app.retrieval_mutex.lock();
+    const encode_err = app.mgt.encode(query_builder.items, &query_tokens);
+    app.retrieval_mutex.unlock();
+    try encode_err;
+
+    if (query_tokens.items.len > 0) {
+        app.retrieval_mutex.lock();
+        const retrieve_err = app.ssi.retrieveTopK(query_tokens.items, ROUTE_TOP_K, allocator);
+        app.retrieval_mutex.unlock();
+        const retrieved = try retrieve_err;
+        freeRankedSegments(candidates, allocator);
+        candidates = retrieved;
+    }
+
+    if (candidates.len > 0 and query_tokens.items.len > 0) {
+        app.retrieval_mutex.lock();
+        const rerank_err = app.ranker.rankCandidatesWithQuery(candidates, query_tokens.items, &app.ssi, allocator);
+        app.retrieval_mutex.unlock();
+        try rerank_err;
+    }
+
+    const fts_query = try makeFtsQuery(allocator, query_builder.items);
+    defer allocator.free(fts_query);
+    if (fts_query.len > 0) {
+        const searched = app.db.searchSkillFtsIds(tenant_id, fts_query) catch blk: {
+            break :blk try allocator.alloc([]u8, 0);
+        };
+        for (fts_ids) |id| allocator.free(id);
+        allocator.free(fts_ids);
+        fts_ids = searched;
+    }
+
+    const skills = try app.db.loadEnabledSkills(tenant_id);
+    var skills_owned = true;
     errdefer {
-        for (selected.items) |*rec| rec.deinit(app.allocator);
+        if (skills_owned) {
+            freeSkillRecords(allocator, skills);
+        }
+    }
+
+    for (skills) |*skill| {
+        const numeric_id = skillNumericId(skill.id);
+        var ranker_rank: usize = std.math.maxInt(usize);
+        var ranker_score: f64 = 0.0;
+        for (candidates, 0..) |candidate, candidate_index| {
+            if (candidate.position == numeric_id) {
+                ranker_rank = candidate_index;
+                ranker_score = candidate.score;
+                break;
+            }
+        }
+        skill.vector_score = ranker_score;
+        skill.sparse_rank = findRank(fts_ids, skill.id);
+        const ranker_component = if (ranker_rank == std.math.maxInt(usize)) 0.0 else 1.0 / @as(f64, @floatFromInt(60 + ranker_rank + 1));
+        const sparse_component = if (skill.sparse_rank == std.math.maxInt(usize)) 0.0 else 1.0 / @as(f64, @floatFromInt(60 + skill.sparse_rank + 1));
+        skill.rrf_score = sparse_component + ranker_component + ranker_score * 0.01;
+    }
+
+    var selected = std.ArrayList(SkillRecord).init(allocator);
+    errdefer {
+        for (selected.items) |*record| record.deinit(allocator);
         selected.deinit();
     }
-    var seen = std.StringHashMap(void).init(app.allocator);
-    defer seen.deinit();
-
-    for (ranked, 0..) |cand, ranker_rank| {
-        const skill_id = app.pos_to_skill_id.get(cand.position) orelse continue;
-        if (seen.contains(skill_id)) continue;
-        const idx = findSkillRecordIndex(skills, skill_id) orelse continue;
-        const sparse_rank = findRank(fts_ids, skill_id);
-        const rrf_score = rrfFuse(ranker_rank, sparse_rank, cand.score);
-        try seen.put(skill_id, {});
-        try appendSkillRecord(&selected, app.allocator, skills[idx], cand.score, sparse_rank, rrf_score);
-        if (selected.items.len >= 5) break;
+    var taken = try allocator.alloc(bool, skills.len);
+    defer allocator.free(taken);
+    @memset(taken, false);
+    var round: usize = 0;
+    while (round < 2 and round < skills.len) : (round += 1) {
+        var best_index: ?usize = null;
+        var best_score: f64 = -1000000.0;
+        for (skills, 0..) |skill, i| {
+            if (taken[i]) continue;
+            if (skill.rrf_score > best_score) {
+                best_score = skill.rrf_score;
+                best_index = i;
+            }
+        }
+        if (best_index) |bi| {
+            taken[bi] = true;
+            const s = skills[bi];
+            try selected.append(SkillRecord{
+                .id = try allocator.dupe(u8, s.id),
+                .name = try allocator.dupe(u8, s.name),
+                .description = try allocator.dupe(u8, s.description),
+                .trigger_json = try allocator.dupe(u8, s.trigger_json),
+                .procedure_json = try allocator.dupe(u8, s.procedure_json),
+                .embedding_json = try allocator.dupe(u8, s.embedding_json),
+                .vector_score = s.vector_score,
+                .sparse_rank = s.sparse_rank,
+                .rrf_score = best_score,
+            });
+        }
     }
-    for (fts_ids, 0..) |skill_id, sparse_rank| {
-        if (seen.contains(skill_id)) continue;
-        const idx = findSkillRecordIndex(skills, skill_id) orelse continue;
-        const rrf_score = rrfFuse(std.math.maxInt(usize), sparse_rank, 0.0);
-        try seen.put(skill_id, {});
-        try appendSkillRecord(&selected, app.allocator, skills[idx], 0.0, sparse_rank, rrf_score);
-        if (selected.items.len >= 5) break;
-    }
 
-    std.sort.heap(SkillRecord, selected.items, {}, skillRecordRrfLessThan);
-    freeSkillRecords(app.allocator, skills);
+    freeSkillRecords(allocator, skills);
+    skills_owned = false;
+    freeRankedSegments(candidates, allocator);
+    candidates_owned = false;
+    for (fts_ids) |id| allocator.free(id);
+    allocator.free(fts_ids);
+    fts_owned = false;
     return selected.toOwnedSlice();
-}
-
-fn findSkillRecordIndex(skills: []SkillRecord, id: []const u8) ?usize {
-    for (skills, 0..) |s, i| {
-        if (std.mem.eql(u8, s.id, id)) return i;
-    }
-    return null;
-}
-
-fn appendSkillRecord(list: *std.ArrayList(SkillRecord), allocator: Allocator, s: SkillRecord, score: f64, sparse_rank: usize, rrf_score: f64) !void {
-    try list.append(.{
-        .id = try allocator.dupe(u8, s.id),
-        .name = try allocator.dupe(u8, s.name),
-        .description = try allocator.dupe(u8, s.description),
-        .trigger_json = try allocator.dupe(u8, s.trigger_json),
-        .procedure_json = try allocator.dupe(u8, s.procedure_json),
-        .embedding_json = try allocator.dupe(u8, s.embedding_json),
-        .vector_score = score,
-        .sparse_rank = sparse_rank,
-        .rrf_score = rrf_score,
-    });
-}
-
-fn skillRecordRrfLessThan(_: void, a: SkillRecord, b: SkillRecord) bool {
-    return a.rrf_score > b.rrf_score;
-}
-
-fn rrfFuse(ranker_rank: usize, sparse_rank: usize, score: f64) f64 {
-    const k: usize = 60;
-    var out: f64 = 0.0;
-    if (ranker_rank != std.math.maxInt(usize)) {
-        out += 1.0 / @as(f64, @floatFromInt(k + ranker_rank + 1));
-    }
-    if (sparse_rank != std.math.maxInt(usize)) {
-        out += 1.0 / @as(f64, @floatFromInt(k + sparse_rank + 1));
-    }
-    out += score * 0.01;
-    return out;
-}
-
-fn vectorRank(skills: []SkillRecord, score: f64) usize {
-    var rank: usize = 0;
-    for (skills) |skill| {
-        if (skill.vector_score > score) rank += 1;
-    }
-    return rank;
 }
 
 fn findRank(ids: [][]u8, id: []const u8) usize {
@@ -7625,7 +8744,7 @@ fn selectedSkillsJson(allocator: Allocator, skills: []SkillRecord) ![]u8 {
         try w.writeAll(skill.trigger_json);
         try w.writeAll(",\"procedure\":");
         try w.writeAll(skill.procedure_json);
-        try w.print(",\"retrieval_score\":{},\"method\":\"mgt_ssi_ranker_rrf_fts5\"}}", .{skill.rrf_score});
+        try w.print(",\"retrieval_score\":{}}}", .{skill.rrf_score});
     }
     try w.writeAll("]");
     return out.toOwnedSlice();
@@ -7646,13 +8765,21 @@ fn buildStepPrompt(allocator: Allocator, procedure_json: []const u8, state_json:
     return out.toOwnedSlice();
 }
 
-fn buildCognitionFrame(allocator: Allocator, state_json: []const u8, observation_json: []const u8, step: i64) ![]u8 {
+fn buildCognitionFrame(app: *App, state_json: []const u8, observation_json: []const u8, step: i64) ![]u8 {
+    const allocator = app.allocator;
     var combined = std.ArrayList(u8).init(allocator);
     defer combined.deinit();
     try combined.writer().print("{s}\n{s}", .{ state_json, observation_json });
-    var vector: [EMBED_DIM]f64 = undefined;
-    embedText(combined.items, &vector);
+    var tokens = std.ArrayList(u32).init(allocator);
+    defer tokens.deinit();
+    app.retrieval_mutex.lock();
+    const encode_err = app.mgt.encode(combined.items, &tokens);
+    app.retrieval_mutex.unlock();
+    try encode_err;
+    const signature = SSI.computeMinHashSignature(tokens.items);
+    var token_bytes: [4]u8 = undefined;
     var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
     const w = out.writer();
     try w.print("{{\"step\":{},\"generated_at\":{},\"matrix\":[", .{ step, nowMillis() });
     var k: usize = 0;
@@ -7662,7 +8789,11 @@ fn buildCognitionFrame(allocator: Allocator, state_json: []const u8, observation
         var h: usize = 0;
         while (h < COG_H) : (h += 1) {
             if (h != 0) try w.writeAll(",");
-            try w.print("{d}", .{vector[k * COG_H + h]});
+            const cell_index = k * COG_H + h;
+            std.mem.writeInt(u32, &token_bytes, @as(u32, @truncate(cell_index)), .little);
+            const cell_hash = stableHash(&token_bytes, signature +% @as(u64, cell_index));
+            const cell_value = (@as(f64, @floatFromInt(cell_hash & 0x1FFFFFFFFFFFFF)) / @as(f64, @floatFromInt(@as(u64, 1) << 53))) * 2.0 - 1.0;
+            try w.print("{d}", .{cell_value});
         }
         try w.writeAll("]");
     }
@@ -7691,7 +8822,7 @@ fn callModelStreaming(app: *App, user_prompt: []const u8) !ModelResult {
     try writeJsonString(bw, system_prompt);
     try bw.writeAll("},{\"role\":\"user\",\"content\":");
     try writeJsonString(bw, user_prompt);
-    try bw.print("}}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}},\"temperature\":0.7,\"max_tokens\":{},\"response_format\":{{\"type\":\"json_object\"}}}}", .{app.config.model_max_tokens});
+    try bw.print("]}},\"stream\":true,\"stream_options\":{{\"include_usage\":true}},\"temperature\":0.7,\"max_tokens\":{},\"response_format\":{{\"type\":\"json_object\"}}}}", .{app.config.model_max_tokens});
 
     const auth = try std.fmt.allocPrint(app.allocator, "Bearer {s}", .{app.config.modular_api_key});
     defer app.allocator.free(auth);
@@ -7717,6 +8848,12 @@ fn callModelStreaming(app: *App, user_prompt: []const u8) !ModelResult {
     return parseModelResponseStream(app.allocator, req.reader());
 }
 
+fn consumeBufferedLine(line_buf: *std.ArrayList(u8), newline_index: usize) void {
+    const remaining = line_buf.items.len - (newline_index + 1);
+    std.mem.copyForwards(u8, line_buf.items[0..remaining], line_buf.items[newline_index + 1 ..]);
+    line_buf.shrinkRetainingCapacity(remaining);
+}
+
 fn parseModelResponseStream(allocator: Allocator, reader: anytype) !ModelResult {
     var content = std.ArrayList(u8).init(allocator);
     errdefer content.deinit();
@@ -7735,30 +8872,29 @@ fn parseModelResponseStream(allocator: Allocator, reader: anytype) !ModelResult 
             if (std.mem.startsWith(u8, line, "data:")) {
                 const payload = std.mem.trim(u8, line[5..], " \t");
                 if (!std.mem.eql(u8, payload, "[DONE]")) {
-                    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch null;
-                    if (parsed) |*p| {
-                        defer p.deinit();
-                        if (objectGetValue(p.value, "usage")) |usage| {
-                            if (objectGetInt(usage, "total_tokens")) |t| total_tokens = t;
-                        }
-                        if (objectGetValue(p.value, "choices")) |choices| {
-                            switch (choices) {
-                                .array => |arr| {
-                                    if (arr.items.len > 0) {
-                                        if (objectGetValue(arr.items[0], "delta")) |delta| {
-                                            if (objectGetString(delta, "content")) |s| try content.appendSlice(s);
-                                        }
+                    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch {
+                        consumeBufferedLine(&line_buf, nl);
+                        continue;
+                    };
+                    defer parsed.deinit();
+                    if (objectGetValue(parsed.value, "usage")) |usage| {
+                        if (objectGetInt(usage, "total_tokens")) |t| total_tokens = t;
+                    }
+                    if (objectGetValue(parsed.value, "choices")) |choices| {
+                        switch (choices) {
+                            .array => |arr| {
+                                if (arr.items.len > 0) {
+                                    if (objectGetValue(arr.items[0], "delta")) |delta| {
+                                        if (objectGetString(delta, "content")) |s| try content.appendSlice(s);
                                     }
-                                },
-                                else => {},
-                            }
+                                }
+                            },
+                            else => {},
                         }
                     }
                 }
             }
-            const rem = line_buf.items.len - (nl + 1);
-            std.mem.copyForwards(u8, line_buf.items[0..rem], line_buf.items[nl + 1 ..]);
-            line_buf.shrinkRetainingCapacity(rem);
+            consumeBufferedLine(&line_buf, nl);
         }
     }
     return ModelResult{ .content = try content.toOwnedSlice(), .total_tokens = total_tokens };
@@ -7872,6 +9008,7 @@ fn executeAuthorizedAction(app: *App, run_id: []const u8, step: i64, action_json
         var run = try app.db.getRun(run_id);
         defer run.deinit(app.allocator);
         _ = try app.db.insertEvent(run.tenant_id, run_id, step, "agent_emit", payload_json);
+        routeTextThroughKnowledge(app, run_id, payload_json);
         return std.fmt.allocPrint(app.allocator, "{{\"ok\":true,\"type\":\"emit\",\"payload\":{s},\"step\":{},\"staleness\":{s},\"at\":{}}}", .{ payload_json, step, staleness_buf.items, now() });
     }
     if (std.mem.eql(u8, typ, "compute")) {
@@ -7911,42 +9048,13 @@ fn executeAuthorizedAction(app: *App, run_id: []const u8, step: i64, action_json
         defer app.allocator.free(trigger_json);
         const procedure_json = try jsonValueToOwned(app.allocator, procedure_value);
         defer app.allocator.free(procedure_json);
-        try app.db.addSkillFromFields(app, run.tenant_id, skill_id, name, description, trigger_json, procedure_json, true);
+        try registerSkill(app, run.tenant_id, skill_id, name, description, trigger_json, procedure_json, true);
         var out = std.ArrayList(u8).init(app.allocator);
         errdefer out.deinit();
         const w = out.writer();
         try w.writeAll("{\"ok\":true,\"type\":\"memory.add_skill\",\"skill_id\":");
         try writeJsonString(w, skill_id);
         try w.print(",\"step\":{d},\"staleness\":{s},\"at\":{d}}}", .{ step, staleness_buf.items, now() });
-        return out.toOwnedSlice();
-    }
-    if (std.mem.eql(u8, typ, "knowledge.query")) {
-        const subject_raw = objectGetString(args, "subject");
-        const relation_raw = objectGetString(args, "relation");
-        const object_raw = objectGetString(args, "object");
-        const subject: ?[]const u8 = if (subject_raw) |v| if (v.len == 0) null else v else null;
-        const relation: ?[]const u8 = if (relation_raw) |v| if (v.len == 0) null else v else null;
-        const object: ?[]const u8 = if (object_raw) |v| if (v.len == 0) null else v else null;
-        app.crev_mutex.lock();
-        defer app.crev_mutex.unlock();
-        const results = try app.crev.queryInferenceKnowledge(subject, relation, object);
-        defer results.deinit();
-        var out = std.ArrayList(u8).init(app.allocator);
-        errdefer out.deinit();
-        const w = out.writer();
-        try w.writeAll("{\"ok\":true,\"type\":\"knowledge.query\",\"triplets\":[");
-        for (results.items, 0..) |t, i| {
-            if (i != 0) try w.writeAll(",");
-            try w.writeAll("{\"subject\":");
-            try writeJsonString(w, t.subject);
-            try w.writeAll(",\"relation\":");
-            try writeJsonString(w, t.relation);
-            try w.writeAll(",\"object\":");
-            try writeJsonString(w, t.object);
-            try w.print(",\"confidence\":{}}}", .{t.confidence});
-        }
-        try w.writeAll("],\"step\":");
-        try w.print("{},\"staleness\":{s},\"at\":{}}}", .{ step, staleness_buf.items, now() });
         return out.toOwnedSlice();
     }
     if (std.mem.eql(u8, typ, "filesystem.write_file")) {
@@ -7957,6 +9065,7 @@ fn executeAuthorizedAction(app: *App, run_id: []const u8, step: i64, action_json
         const resolved = try resolveWorkspacePath(app.allocator, app.config.workspace_root, path);
         defer app.allocator.free(resolved);
         try atomicWriteFile(app.allocator, resolved, content);
+        routeTextThroughKnowledge(app, run_id, content);
         var out = std.ArrayList(u8).init(app.allocator);
         errdefer out.deinit();
         const w = out.writer();
@@ -7992,6 +9101,7 @@ fn executeAuthorizedAction(app: *App, run_id: []const u8, step: i64, action_json
         const resolved = try resolveWorkspacePath(app.allocator, app.config.workspace_root, path);
         defer app.allocator.free(resolved);
         const appended = try appendFileLineOriented(app.allocator, resolved, content, unique);
+        routeTextThroughKnowledge(app, run_id, content);
         var out = std.ArrayList(u8).init(app.allocator);
         errdefer out.deinit();
         const w = out.writer();
@@ -8084,6 +9194,34 @@ fn executeAuthorizedAction(app: *App, run_id: []const u8, step: i64, action_json
         try w.print(",\"step\":{d},\"staleness\":{s},\"at\":{d}}}", .{ step, staleness_buf.items, now() });
         return out.toOwnedSlice();
     }
+    if (std.mem.eql(u8, typ, "knowledge.query")) {
+        const subject = objectGetString(args, "subject");
+        const relation = objectGetString(args, "relation");
+        const object = objectGetString(args, "object");
+        app.graph_mutex.lock();
+        defer app.graph_mutex.unlock();
+        var results = try app.crev.queryInferenceKnowledge(subject, relation, object);
+        defer results.deinit();
+        var out = std.ArrayList(u8).init(app.allocator);
+        errdefer out.deinit();
+        const w = out.writer();
+        try w.writeAll("{\"ok\":true,\"type\":\"knowledge.query\",\"count\":");
+        try w.print("{}", .{results.items.len});
+        try w.writeAll(",\"triplets\":[");
+        for (results.items, 0..) |triplet, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.writeAll("{\"subject\":");
+            try writeJsonString(w, triplet.subject);
+            try w.writeAll(",\"relation\":");
+            try writeJsonString(w, triplet.relation);
+            try w.writeAll(",\"object\":");
+            try writeJsonString(w, triplet.object);
+            try w.print(",\"confidence\":{d}}}", .{triplet.confidence});
+        }
+        try w.writeAll("]");
+        try w.print(",\"step\":{d},\"staleness\":{s},\"at\":{d}}}", .{ step, staleness_buf.items, now() });
+        return out.toOwnedSlice();
+    }
     if (std.mem.eql(u8, typ, "http.get")) {
         const url = objectGetString(args, "url") orelse return error.MissingUrl;
         if (!isHttpHostAllowed(app.config.allowed_http_hosts, url)) return error.HttpHostNotAllowed;
@@ -8111,8 +9249,62 @@ fn executeAuthorizedAction(app: *App, run_id: []const u8, step: i64, action_json
     return error.ActionNotAllowed;
 }
 
-fn evaluateStepVerifier(allocator: Allocator, _: []const u8, outcome_json: []const u8) ![]u8 {
-    const success = !containsIgnoreCase(outcome_json, "\"ok\":false") and !containsIgnoreCase(outcome_json, "fatal_exception") and !containsIgnoreCase(outcome_json, "fatal_error");
+fn routeTextThroughKnowledge(app: *App, run_id: []const u8, text: []const u8) void {
+    if (text.len == 0) return;
+    {
+        app.graph_mutex.lock();
+        defer app.graph_mutex.unlock();
+        _ = app.crev.processTextStream(text) catch return;
+    }
+    refreshRunFacts(app, run_id) catch {};
+}
+
+fn validatedFactsJson(allocator: Allocator, index: *KnowledgeGraphIndex) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("[");
+    for (index.all_triplets.items, 0..) |triplet, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"subject\":");
+        try writeJsonString(w, triplet.subject);
+        try w.writeAll(",\"relation\":");
+        try writeJsonString(w, triplet.relation);
+        try w.writeAll(",\"object\":");
+        try writeJsonString(w, triplet.object);
+        try w.print(",\"confidence\":{d}}}", .{triplet.confidence});
+    }
+    try w.writeAll("]");
+    return out.toOwnedSlice();
+}
+
+fn refreshRunFacts(app: *App, run_id: []const u8) !void {
+    const facts_json = blk: {
+        app.graph_mutex.lock();
+        defer app.graph_mutex.unlock();
+        break :blk try validatedFactsJson(app.allocator, &app.crev.knowledge_index);
+    };
+    defer app.allocator.free(facts_json);
+    try app.db.setRunStateKey(run_id, "facts", facts_json);
+}
+
+fn observationTextFromJson(allocator: Allocator, observation_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, observation_json, .{}) catch {
+        return allocator.dupe(u8, observation_json);
+    };
+    defer parsed.deinit();
+    if (objectGetString(parsed.value, "content")) |content| {
+        return allocator.dupe(u8, content);
+    }
+    if (objectGetString(parsed.value, "text")) |text| {
+        return allocator.dupe(u8, text);
+    }
+    return allocator.dupe(u8, observation_json);
+}
+
+fn evaluateStepVerifier(allocator: Allocator, state_json: []const u8, outcome_json: []const u8) ![]u8 {
+    _ = state_json;
+    const success = !containsIgnoreCase(outcome_json, "\"ok\":false") and !containsIgnoreCase(outcome_json, "\"error\":\"fatal\"");
     return std.fmt.allocPrint(allocator, "{{\"success\":{},\"checked_at\":{},\"scope\":\"step\"}}", .{ success, now() });
 }
 
@@ -8123,6 +9315,8 @@ fn finalizeTrajectory(app: *App, run_id: []const u8) !void {
     const verifier = try evaluateTerminalVerifiers(app, &run);
     defer app.allocator.free(verifier);
     _ = try app.db.insertEvent(run.tenant_id, run_id, run.step, "terminal_verifier", verifier);
+    const trajectory_success = !containsIgnoreCase(verifier, "\"success\":false");
+    calibrateRouterFromOutcome(app, run_id, trajectory_success);
     if (containsIgnoreCase(verifier, "\"success\":false")) {
         const reflection = generateReflectionPatch(app, &run, verifier) catch |err| blk: {
             break :blk try std.fmt.allocPrint(app.allocator, "{{\"diagnosis\":\"reflection_generation_failed\",\"error\":\"{s}\",\"patches\":[]}}", .{@errorName(err)});
@@ -8138,6 +9332,53 @@ fn finalizeTrajectory(app: *App, run_id: []const u8) !void {
         try app.db.insertSkillPatch(run.tenant_id, patch_id, null, if (containsIgnoreCase(report, "\"accepted\":true")) "accepted" else "rejected", reflection, report);
         optimizePolicyFromReflection(app, &run, reflection) catch {};
     }
+}
+
+fn calibrateRouterFromOutcome(app: *App, run_id: []const u8, success: bool) void {
+    const state_json = app.db.getStateJson(run_id) catch return;
+    defer app.allocator.free(state_json);
+    const observation_json = blk: {
+        var run = app.db.getRun(run_id) catch return;
+        defer run.deinit(app.allocator);
+        break :blk app.allocator.dupe(u8, run.latest_observation_json) catch return;
+    };
+    defer app.allocator.free(observation_json);
+
+    var combined = std.ArrayList(u8).init(app.allocator);
+    defer combined.deinit();
+    combined.writer().print("{s}\n{s}", .{ state_json, observation_json }) catch return;
+
+    var query_tokens = std.ArrayList(u32).init(app.allocator);
+    defer query_tokens.deinit();
+
+    var samples = std.ArrayList([]u32).init(app.allocator);
+    defer {
+        for (samples.items) |sample| app.allocator.free(sample);
+        samples.deinit();
+    }
+    var labels = std.ArrayList(f32).init(app.allocator);
+    defer labels.deinit();
+
+    const target: f32 = if (success) 1.0 else 0.0;
+
+    app.retrieval_mutex.lock();
+    defer app.retrieval_mutex.unlock();
+
+    app.mgt.encode(combined.items, &query_tokens) catch return;
+    if (query_tokens.items.len == 0) return;
+
+    const retrieved = app.ssi.retrieveTopK(query_tokens.items, 8, app.allocator) catch return;
+    defer freeRankedSegments(retrieved, app.allocator);
+    for (retrieved) |segment| {
+        const copy = app.allocator.dupe(u32, segment.tokens) catch return;
+        samples.append(copy) catch {
+            app.allocator.free(copy);
+            return;
+        };
+        labels.append(target) catch return;
+    }
+    if (samples.items.len == 0) return;
+    app.ranker.calibrateWeights(samples.items, labels.items, &app.ssi, 1) catch {};
 }
 
 fn evaluateTerminalVerifiers(app: *App, run: *RunRecord) ![]u8 {
@@ -8172,11 +9413,11 @@ fn evaluateTerminalVerifiers(app: *App, run: *RunRecord) ![]u8 {
                         }
                     } else if (std.mem.eql(u8, vtype, "file_exists")) {
                         if (objectGetString(v, "path")) |p| {
-                            const resolved = resolveWorkspacePath(app.allocator, app.config.workspace_root, p) catch "";
-                            if (resolved.len > 0) {
-                                defer app.allocator.free(resolved);
+                            const resolved = resolveWorkspacePath(app.allocator, app.config.workspace_root, p) catch null;
+                            if (resolved) |resolved_path| {
+                                defer app.allocator.free(resolved_path);
                                 passed = blk: {
-                                    std.fs.cwd().access(resolved, .{}) catch break :blk false;
+                                    std.fs.cwd().access(resolved_path, .{}) catch break :blk false;
                                     break :blk true;
                                 };
                             }
@@ -8184,14 +9425,17 @@ fn evaluateTerminalVerifiers(app: *App, run: *RunRecord) ![]u8 {
                     } else if (std.mem.eql(u8, vtype, "file_contains_lines")) {
                         if (objectGetString(v, "path")) |p| {
                             const lines = objectGetValue(v, "lines") orelse std.json.Value{ .array = std.json.Array.init(app.allocator) };
-                            const resolved = resolveWorkspacePath(app.allocator, app.config.workspace_root, p) catch "";
-                            if (resolved.len > 0) {
-                                defer app.allocator.free(resolved);
-                                const check_res = checkLines(app.allocator, resolved, lines) catch blk: {
-                                    break :blk try app.allocator.dupe(u8, "[]");
-                                };
-                                defer app.allocator.free(check_res);
-                                passed = !containsIgnoreCase(check_res, "false");
+                            const resolved = resolveWorkspacePath(app.allocator, app.config.workspace_root, p) catch null;
+                            if (resolved) |resolved_path| {
+                                defer app.allocator.free(resolved_path);
+                                var check_res_storage: []const u8 = "[]";
+                                var check_res_owned = false;
+                                if (checkLines(app.allocator, resolved_path, lines)) |check_result| {
+                                    check_res_storage = check_result;
+                                    check_res_owned = true;
+                                } else |_| {}
+                                passed = !containsIgnoreCase(check_res_storage, "false");
+                                if (check_res_owned) app.allocator.free(check_res_storage);
                             }
                         }
                     } else if (std.mem.eql(u8, vtype, "min_progress")) {
@@ -8266,7 +9510,7 @@ fn validateAndApplySkillPatch(app: *App, tenant_id: []const u8, patch_json: []co
     const procedure_json = try jsonValueToOwned(app.allocator, procedure_value);
     defer app.allocator.free(procedure_json);
 
-    try app.db.addSkillFromFields(app, tenant_id, skill_id, name, description, trigger_json, procedure_json, true);
+    try registerSkill(app, tenant_id, skill_id, name, description, trigger_json, procedure_json, true);
     var out = std.ArrayList(u8).init(app.allocator);
     errdefer out.deinit();
     const w = out.writer();
@@ -8401,15 +9645,26 @@ fn metaHarnessEntry(app: *App) void {
 }
 
 fn consolidateKnowledge(app: *App, tenant_id: []const u8) !void {
-    const markdown = try app.db.buildKnowledgeMarkdown(tenant_id);
+    const skills_markdown = try app.db.buildKnowledgeMarkdown(tenant_id);
+    defer app.allocator.free(skills_markdown);
+    const facts_markdown = try buildKnowledgeFactsMarkdown(app);
+    defer app.allocator.free(facts_markdown);
+    var full_markdown = std.ArrayList(u8).init(app.allocator);
+    defer full_markdown.deinit();
+    try full_markdown.appendSlice(skills_markdown);
+    try full_markdown.appendSlice(facts_markdown);
+    const markdown = try full_markdown.toOwnedSlice();
     defer app.allocator.free(markdown);
     try std.fs.cwd().makePath(app.config.knowledge_root);
     const playbook_path = try std.fs.path.join(app.allocator, &.{ app.config.knowledge_root, "PLAYBOOK.md" });
     defer app.allocator.free(playbook_path);
-    const old = std.fs.cwd().readFileAlloc(app.allocator, playbook_path, 16 * 1024 * 1024) catch blk: {
-        break :blk try app.allocator.dupe(u8, "");
-    };
-    defer app.allocator.free(old);
+    var old_storage: []const u8 = "";
+    var old_owned = false;
+    if (std.fs.cwd().readFileAlloc(app.allocator, playbook_path, 16 * 1024 * 1024)) |loaded| {
+        old_storage = loaded;
+        old_owned = true;
+    } else |_| {}
+    defer if (old_owned) app.allocator.free(old_storage);
     try atomicWriteFile(app.allocator, playbook_path, markdown);
     _ = runGit(app, &[_][]const u8{ "git", "-C", app.config.knowledge_root, "init" }) catch {};
     _ = runGit(app, &[_][]const u8{ "git", "-C", app.config.knowledge_root, "add", "PLAYBOOK.md" }) catch {};
@@ -8418,9 +9673,33 @@ fn consolidateKnowledge(app: *App, tenant_id: []const u8) !void {
     _ = runGit(app, &[_][]const u8{ "git", "-C", app.config.knowledge_root, "-c", "user.name=agent-runtime", "-c", "user.email=agent-runtime@local", "commit", "-m", message }) catch {};
     const commit = runGit(app, &[_][]const u8{ "git", "-C", app.config.knowledge_root, "rev-parse", "HEAD" }) catch try app.allocator.dupe(u8, "head");
     defer app.allocator.free(commit);
-    const diff = diffText(app.allocator, old, markdown) catch try app.allocator.dupe(u8, "no diff");
+    const diff = diffText(app.allocator, old_storage, markdown) catch try app.allocator.dupe(u8, "no diff");
     defer app.allocator.free(diff);
     try app.db.insertKnowledgeVersion(tenant_id, markdown, std.mem.trim(u8, commit, " \t\r\n"), diff);
+}
+
+fn buildKnowledgeFactsMarkdown(app: *App) ![]u8 {
+    app.graph_mutex.lock();
+    defer app.graph_mutex.unlock();
+    var out = std.ArrayList(u8).init(app.allocator);
+    errdefer out.deinit();
+    const w = out.writer();
+    try w.writeAll("\n## Verified Knowledge Graph Facts\n\n");
+    const total = app.crev.knowledge_index.all_triplets.items.len;
+    if (total == 0) {
+        try w.writeAll("No validated relational facts recorded yet.\n");
+        return out.toOwnedSlice();
+    }
+    var listed: usize = 0;
+    for (app.crev.knowledge_index.all_triplets.items) |triplet| {
+        if (listed >= 200) break;
+        listed += 1;
+        try w.print("- {s} --[{s}]--> {s} (confidence {d:.4})\n", .{ triplet.subject, triplet.relation, triplet.object, triplet.confidence });
+    }
+    if (total > listed) {
+        try w.print("\n...and {} more validated facts held in the relational knowledge graph.\n", .{total - listed});
+    }
+    return out.toOwnedSlice();
 }
 
 fn runGit(app: *App, argv: []const []const u8) ![]u8 {
@@ -8441,70 +9720,77 @@ fn runGit(app: *App, argv: []const []const u8) ![]u8 {
     return result.stdout;
 }
 
+const DiffOp = struct {
+    const Kind = enum { remove, insert };
+    kind: Kind,
+    line_no: usize,
+    text: []const u8,
+};
+
 fn diffText(allocator: Allocator, old: []const u8, new: []const u8) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
     if (std.mem.eql(u8, old, new)) {
         try out.writer().writeAll("no changes\n");
         return out.toOwnedSlice();
     }
+    var old_lines = std.ArrayList([]const u8).init(allocator);
+    defer old_lines.deinit();
+    var old_split = std.mem.splitScalar(u8, old, '\n');
+    while (old_split.next()) |line| try old_lines.append(line);
+    var new_lines = std.ArrayList([]const u8).init(allocator);
+    defer new_lines.deinit();
+    var new_split = std.mem.splitScalar(u8, new, '\n');
+    while (new_split.next()) |line| try new_lines.append(line);
 
-    var old_owned = std.ArrayList([]const u8).init(allocator);
-    defer old_owned.deinit();
-    var old_lines = std.mem.splitScalar(u8, old, '\n');
-    while (old_lines.next()) |ln| try old_owned.append(ln);
+    const m = old_lines.items.len;
+    const n = new_lines.items.len;
+    const row_stride = n + 1;
+    const cell_count = std.math.mul(usize, m + 1, row_stride) catch return error.DiffTooLarge;
+    var table = try allocator.alloc(u32, cell_count);
+    defer allocator.free(table);
+    @memset(table, 0);
 
-    var new_owned = std.ArrayList([]const u8).init(allocator);
-    defer new_owned.deinit();
-    var new_lines = std.mem.splitScalar(u8, new, '\n');
-    while (new_lines.next()) |ln| try new_owned.append(ln);
-
-    const n = old_owned.items.len;
-    const m = new_owned.items.len;
-    const lcs = try allocator.alloc(usize, (n + 1) * (m + 1));
-    defer allocator.free(lcs);
-    @memset(lcs, 0);
-
-    const stride = m + 1;
     var i: usize = 1;
-    while (i <= n) : (i += 1) {
+    while (i <= m) : (i += 1) {
         var j: usize = 1;
-        while (j <= m) : (j += 1) {
-            if (std.mem.eql(u8, old_owned.items[i - 1], new_owned.items[j - 1])) {
-                lcs[i * stride + j] = lcs[(i - 1) * stride + (j - 1)] + 1;
+        while (j <= n) : (j += 1) {
+            if (std.mem.eql(u8, old_lines.items[i - 1], new_lines.items[j - 1])) {
+                table[i * row_stride + j] = table[(i - 1) * row_stride + (j - 1)] + 1;
             } else {
-                lcs[i * stride + j] = @max(lcs[(i - 1) * stride + j], lcs[i * stride + (j - 1)]);
+                const up = table[(i - 1) * row_stride + j];
+                const left = table[i * row_stride + (j - 1)];
+                table[i * row_stride + j] = if (up >= left) up else left;
             }
         }
     }
 
-    var line: usize = 1;
-    var ri: usize = n;
-    var rj: usize = m;
-    while (ri > 0 and rj > 0) {
-        if (std.mem.eql(u8, old_owned.items[ri - 1], new_owned.items[rj - 1])) {
-            try out.writer().print(" {d}::{s}\n", .{ line, old_owned.items[ri - 1] });
-            ri -= 1;
-            rj -= 1;
-            line += 1;
-        } else if (lcs[(ri - 1) * stride + rj] >= lcs[ri * stride + (rj - 1)]) {
-            try out.writer().print("-{d}:{s}\n", .{ line, old_owned.items[ri - 1] });
-            ri -= 1;
-            line += 1;
+    var ops = std.ArrayList(DiffOp).init(allocator);
+    defer ops.deinit();
+    var bi = m;
+    var bj = n;
+    while (bi > 0 or bj > 0) {
+        if (bi > 0 and bj > 0 and std.mem.eql(u8, old_lines.items[bi - 1], new_lines.items[bj - 1])) {
+            bi -= 1;
+            bj -= 1;
+        } else if (bj > 0 and (bi == 0 or table[bi * row_stride + (bj - 1)] >= table[(bi - 1) * row_stride + bj])) {
+            try ops.append(.{ .kind = .insert, .line_no = bj, .text = new_lines.items[bj - 1] });
+            bj -= 1;
         } else {
-            try out.writer().print("+{d}:{s}\n", .{ line, new_owned.items[rj - 1] });
-            rj -= 1;
-            line += 1;
+            try ops.append(.{ .kind = .remove, .line_no = bi, .text = old_lines.items[bi - 1] });
+            bi -= 1;
         }
     }
-    while (ri > 0) : (ri -= 1) {
-        try out.writer().print("-{d}:{s}\n", .{ line, old_owned.items[ri - 1] });
-        line += 1;
-    }
-    while (rj > 0) : (rj -= 1) {
-        try out.writer().print("+{d}:{s}\n", .{ line, new_owned.items[rj - 1] });
-        line += 1;
-    }
 
+    var index: usize = ops.items.len;
+    while (index > 0) {
+        index -= 1;
+        const op = ops.items[index];
+        switch (op.kind) {
+            .remove => try out.writer().print("-{}:{s}\n", .{ op.line_no, op.text }),
+            .insert => try out.writer().print("+{}:{s}\n", .{ op.line_no, op.text }),
+        }
+    }
     return out.toOwnedSlice();
 }
 
@@ -8650,6 +9936,9 @@ fn handleRequest(app: *App, allocator: Allocator, fd: std.posix.socket_t, req: *
             try validateJsonText(allocator, req.body);
             try app.db.enqueueObservation(run_id, req.body);
             _ = try app.db.insertEvent(tenant_id, run_id, 0, "external_observation", req.body);
+            const obs_text = try observationTextFromJson(allocator, req.body);
+            defer allocator.free(obs_text);
+            routeTextThroughKnowledge(app, run_id, obs_text);
             try sendResponse(allocator, fd, 200, "application/json", "{\"ok\":true}");
             return;
         }
@@ -8712,7 +10001,7 @@ fn streamEvents(app: *App, allocator: Allocator, fd: std.posix.socket_t, tenant_
     const last_id_text = queryParam(allocator, query, "last_id") catch "";
     var last_id = std.fmt.parseInt(i64, last_id_text, 10) catch 0;
     var loops: usize = 0;
-    while (loops < 3600) {
+    while (loops < 3600) : (loops += 1) {
         const events = try app.db.eventsSinceJson(tenant_id, run_id, last_id);
         defer app.allocator.free(events);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, events, .{});
@@ -8735,7 +10024,6 @@ fn streamEvents(app: *App, allocator: Allocator, fd: std.posix.socket_t, tenant_
         }
         try writeAllFd(fd, ": keepalive\n\n");
         std.time.sleep(1000 * std.time.ns_per_ms);
-        loops += 1;
     }
 }
 
@@ -8912,89 +10200,6 @@ fn objectGetFloat(value: std.json.Value, key: []const u8) ?f64 {
     }
 }
 
-fn embedText(text: []const u8, out: *[EMBED_DIM]f64) void {
-    for (out) |*v| v.* = 0.0;
-    var hash: u64 = 14695981039346656037;
-    var active = false;
-    var count: usize = 0;
-    for (text) |c0| {
-        const c = std.ascii.toLower(c0);
-        if (std.ascii.isAlphanumeric(c)) {
-            active = true;
-            count += 1;
-            hash ^= c;
-            hash *%= 1099511628211;
-        } else if (active) {
-            commitEmbeddingToken(out, hash, count);
-            hash = 14695981039346656037;
-            active = false;
-            count = 0;
-        }
-    }
-    if (active) commitEmbeddingToken(out, hash, count);
-    var norm: f64 = 0.0;
-    for (out.*) |v| norm += v * v;
-    norm = std.math.sqrt(norm);
-    if (norm > 0.0) {
-        for (out) |*v| v.* /= norm;
-    }
-}
-
-fn commitEmbeddingToken(out: *[EMBED_DIM]f64, hash: u64, count: usize) void {
-    const idx: usize = @intCast(hash % EMBED_DIM);
-    const sign: f64 = if ((hash & 1) == 0) 1.0 else -1.0;
-    const weight = 1.0 + std.math.log(f64, 2.0, @as(f64, @floatFromInt(count + 1))) * 0.1;
-    out[idx] += sign * weight;
-}
-
-fn embeddingToJson(allocator: Allocator, vector: *const [EMBED_DIM]f64) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
-    const w = out.writer();
-    try w.writeAll("[");
-    for (vector.*, 0..) |v, i| {
-        if (i != 0) try w.writeAll(",");
-        try w.print("{d}", .{v});
-    }
-    try w.writeAll("]");
-    return out.toOwnedSlice();
-}
-
-fn parseEmbedding(allocator: Allocator, json: []const u8) ![EMBED_DIM]f64 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-    defer parsed.deinit();
-    var out: [EMBED_DIM]f64 = undefined;
-    for (&out) |*v| v.* = 0.0;
-    switch (parsed.value) {
-        .array => |arr| {
-            const n = @min(arr.items.len, EMBED_DIM);
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                out[i] = switch (arr.items[i]) {
-                    .integer => |iv| @floatFromInt(iv),
-                    .float => |fv| fv,
-                    else => 0.0,
-                };
-            }
-        },
-        else => return error.InvalidEmbedding,
-    }
-    return out;
-}
-
-fn cosine(a: *const [EMBED_DIM]f64, b: *const [EMBED_DIM]f64) f64 {
-    var dot: f64 = 0.0;
-    var na: f64 = 0.0;
-    var nb: f64 = 0.0;
-    var i: usize = 0;
-    while (i < EMBED_DIM) : (i += 1) {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
-    if (na <= 0 or nb <= 0) return 0.0;
-    return dot / (std.math.sqrt(na) * std.math.sqrt(nb));
-}
-
 fn makeFtsQuery(allocator: Allocator, text: []const u8) ![]u8 {
     var out = std.ArrayList(u8).init(allocator);
     var hash_set = std.StringHashMap(void).init(allocator);
@@ -9009,7 +10214,7 @@ fn makeFtsQuery(allocator: Allocator, text: []const u8) ![]u8 {
             if (token.items.len >= 3 and emitted < 12 and !hash_set.contains(token.items)) {
                 const copy = try allocator.dupe(u8, token.items);
                 try hash_set.put(copy, {});
-                if (emitted != 0) try out.appendSlice(" OR ");
+                if (emitted != 0) try out.writer().writeAll(" OR ");
                 try out.writer().print("{s}", .{token.items});
                 emitted += 1;
             }
@@ -9019,7 +10224,7 @@ fn makeFtsQuery(allocator: Allocator, text: []const u8) ![]u8 {
     if (token.items.len >= 3 and emitted < 12 and !hash_set.contains(token.items)) {
         const copy = try allocator.dupe(u8, token.items);
         try hash_set.put(copy, {});
-        if (emitted != 0) try out.appendSlice(" OR ");
+        if (emitted != 0) try out.writer().writeAll(" OR ");
         try out.writer().print("{s}", .{token.items});
         emitted += 1;
     }
@@ -9068,9 +10273,11 @@ fn appendFileLineOriented(allocator: Allocator, path: []const u8, content: []con
         const line = std.mem.trimRight(u8, line_raw, "\r");
         if (line.len == 0) continue;
         if (unique and map.contains(line)) continue;
+        if (unique) {
+            try map.put(line, {});
+        }
         try out.appendSlice(line);
         try out.append('\n');
-        if (unique) try map.put(line, {});
         appended += 1;
     }
     try atomicWriteFile(allocator, path, out.items);
@@ -9084,6 +10291,9 @@ fn replaceLines(allocator: Allocator, path: []const u8, start_line: usize, end_l
     defer lines.deinit();
     var it = std.mem.splitScalar(u8, existing, '\n');
     while (it.next()) |line| try lines.append(std.mem.trimRight(u8, line, "\r"));
+    if (existing.len > 0 and existing[existing.len - 1] == '\n' and lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+        _ = lines.pop();
+    }
     if (start_line == 0 or end_line < start_line or start_line > lines.items.len + 1 or end_line > lines.items.len) return error.InvalidLineRange;
     var out = std.ArrayList(u8).init(allocator);
     defer out.deinit();
@@ -9175,3 +10385,369 @@ fn joinUrl(allocator: Allocator, base: []const u8, suffix: []const u8) ![]u8 {
     if (std.mem.endsWith(u8, base, "/")) return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, suffix });
 }
+
+
+test "stableHash deterministic and seed sensitive" {
+    const a = stableHash("autonomous agent runtime", 42);
+    const b = stableHash("autonomous agent runtime", 42);
+    const c = stableHash("autonomous agent runtime", 43);
+    try std.testing.expectEqual(a, b);
+    try std.testing.expect(a != c);
+}
+
+test "BitSet popcount intersection union and jaccard" {
+    const gpa = std.testing.allocator;
+    var set_a = try BitSet.init(gpa, 192);
+    defer set_a.deinit();
+    var set_b = try BitSet.init(gpa, 192);
+    defer set_b.deinit();
+    set_a.set(0);
+    set_a.set(64);
+    set_a.set(128);
+    set_b.set(64);
+    set_b.set(129);
+    try std.testing.expectEqual(@as(usize, 1), set_a.intersectionPopCount(&set_b));
+    try std.testing.expectEqual(@as(usize, 4), set_a.unionPopCount(&set_b));
+    try std.testing.expect(set_a.get(64));
+    try std.testing.expect(!set_a.get(65));
+    const estimate = set_a.jaccardEstimate(&set_b);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), estimate, @as(f32, 0.001));
+}
+
+test "Tensor init deinit and shape" {
+    const gpa = std.testing.allocator;
+    var tensor = try Tensor.init(gpa, &.{ 3, 4 });
+    defer tensor.deinit();
+    try std.testing.expectEqual(@as(usize, 12), tensor.data.len);
+    try std.testing.expectEqual(@as(usize, 2), tensor.shape.dims.len);
+    try std.testing.expectEqual(@as(usize, 4), tensor.shape.dims[1]);
+}
+
+test "RankedSegment init and deinit" {
+    const gpa = std.testing.allocator;
+    var segment = try RankedSegment.init(gpa, &.{ 7, 8, 9 }, 0.5, 12, true);
+    defer segment.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 3), segment.tokens.len);
+    try std.testing.expectEqual(@as(u64, 12), segment.position);
+    try std.testing.expect(segment.anchor);
+}
+
+test "MGT dual language loads english and hungarian morphemes" {
+    const gpa = std.testing.allocator;
+    var mgt_dual = try MGT.init(gpa, &.{}, &.{}, null, .dual);
+    defer mgt_dual.deinit();
+    try std.testing.expect(mgt_dual.prefixes.contains("un"));
+    try std.testing.expect(mgt_dual.prefixes.contains("meg"));
+    try std.testing.expect(mgt_dual.suffixes.contains("ing"));
+    try std.testing.expect(mgt_dual.suffixes.contains("ság"));
+}
+
+test "diffText LCS handles single line insertion" {
+    const gpa = std.testing.allocator;
+    const old_text = "alpha\nbeta\ngamma";
+    const new_text = "alpha\ninserted\nbeta\ngamma";
+    const diff = try diffText(gpa, old_text, new_text);
+    defer gpa.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+2:inserted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "-") == null);
+}
+
+test "diffText LCS handles single line deletion" {
+    const gpa = std.testing.allocator;
+    const old_text = "alpha\nbeta\ngamma";
+    const new_text = "alpha\ngamma";
+    const diff = try diffText(gpa, old_text, new_text);
+    defer gpa.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "-2:beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+") == null);
+}
+
+test "diffText reports no changes" {
+    const gpa = std.testing.allocator;
+    const diff = try diffText(gpa, "same\ntext", "same\ntext");
+    defer gpa.free(diff);
+    try std.testing.expectEqualStrings("no changes\n", diff);
+}
+
+test "makeFtsQuery emits trailing token without delimiter" {
+    const gpa = std.testing.allocator;
+    const query = try makeFtsQuery(gpa, "planning status executing trailing");
+    defer gpa.free(query);
+    try std.testing.expect(std.mem.indexOf(u8, query, "trailing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query, "planning") != null);
+}
+
+test "makeFtsQuery deduplicates tokens" {
+    const gpa = std.testing.allocator;
+    const query = try makeFtsQuery(gpa, "duplicate duplicate duplicate");
+    defer gpa.free(query);
+    const first = std.mem.indexOf(u8, query, "duplicate").?;
+    const second = std.mem.indexOf(u8, query[first + 1 ..], "duplicate");
+    try std.testing.expect(second == null);
+}
+
+test "appendFileLineOriented deduplicates within batch when unique" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_path);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, "log.txt" });
+    defer gpa.free(path);
+    const appended = try appendFileLineOriented(gpa, path, "first\nfirst\nsecond\n", true);
+    try std.testing.expectEqual(@as(usize, 2), appended);
+    const data = try std.fs.cwd().readFileAlloc(gpa, path, 1024 * 1024);
+    defer gpa.free(data);
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "first")) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "replaceLines rejects end line beyond file length" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_path);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, "lines.txt" });
+    defer gpa.free(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "one\ntwo\nthree\n" });
+    const result = replaceLines(gpa, path, 1, 99, "replacement");
+    try std.testing.expectError(error.InvalidLineRange, result);
+    const unchanged = try std.fs.cwd().readFileAlloc(gpa, path, 1024 * 1024);
+    defer gpa.free(unchanged);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", unchanged);
+}
+
+test "replaceLines swaps bounded range" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_path);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, "lines2.txt" });
+    defer gpa.free(path);
+    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = "one\ntwo\nthree\n" });
+    try replaceLines(gpa, path, 2, 2, "replaced");
+    const updated = try std.fs.cwd().readFileAlloc(gpa, path, 1024 * 1024);
+    defer gpa.free(updated);
+    try std.testing.expectEqualStrings("one\nreplaced\nthree\n", updated);
+}
+
+test "atomicWriteFile writes content and keeps destination on success" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_path);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, "atomic.txt" });
+    defer gpa.free(path);
+    try atomicWriteFile(gpa, path, "payload");
+    const data = try std.fs.cwd().readFileAlloc(gpa, path, 1024 * 1024);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("payload", data);
+}
+
+test "evaluateStepVerifier passes intermediate step with done false state" {
+    const gpa = std.testing.allocator;
+    const state_json = "{\"done\":false,\"progress\":1}";
+    const outcome_json = "{\"ok\":true,\"type\":\"compute\",\"result\":42}";
+    const verifier = try evaluateStepVerifier(gpa, state_json, outcome_json);
+    defer gpa.free(verifier);
+    try std.testing.expect(std.mem.indexOf(u8, verifier, "\"success\":true") != null);
+}
+
+test "evaluateStepVerifier fails outcome reporting ok false" {
+    const gpa = std.testing.allocator;
+    const verifier = try evaluateStepVerifier(gpa, "{\"done\":false}", "{\"ok\":false,\"type\":\"tool_error\"}");
+    defer gpa.free(verifier);
+    try std.testing.expect(std.mem.indexOf(u8, verifier, "\"success\":false") != null);
+}
+
+test "validateValueBounded rejects both reasoning spellings" {
+    const gpa = std.testing.allocator;
+    const payload_space = "{\"note\":\"show your reasoning trace now\"}";
+    try std.testing.expectError(error.ReasoningLeak, validateJsonText(gpa, payload_space));
+    const payload_underscore = "{\"note\":\"show your reasoning_trace now\"}";
+    try std.testing.expectError(error.ReasoningLeak, validateJsonText(gpa, payload_underscore));
+}
+
+test "CREV resolves conflict with confidence squaring" {
+    const gpa = std.testing.allocator;
+    var kernel = ChaosCoreKernel.init(gpa);
+    defer kernel.deinit();
+    var pipeline = try CREVPipeline.init(gpa, &kernel);
+    defer pipeline.deinit();
+
+    var incoming = try RelationalTriplet.init(gpa, "agent", "is_a", "planner", 0.9);
+    defer incoming.deinit();
+    var stronger = try RelationalTriplet.init(gpa, "agent", "is_not", "planner", 0.99);
+    var conflicts = [_]*RelationalTriplet{&stronger};
+    defer stronger.deinit();
+
+    const resolved = try pipeline.resolveConflicts(&incoming, &conflicts);
+    defer if (resolved != &incoming) {
+        resolved.deinit();
+        gpa.destroy(resolved);
+    };
+    try std.testing.expect(resolved != &incoming);
+    const expected = (0.9 * 0.9 + 0.99 * 0.99) / (0.9 + 0.99);
+    try std.testing.expectApproxEqAbs(expected, resolved.confidence, 0.0001);
+}
+
+test "CREV detects mutual exclusion contradictions" {
+    const gpa = std.testing.allocator;
+    var kernel = ChaosCoreKernel.init(gpa);
+    defer kernel.deinit();
+    var pipeline = try CREVPipeline.init(gpa, &kernel);
+    defer pipeline.deinit();
+
+    var has = try RelationalTriplet.init(gpa, "cache", "has", "entries", 0.9);
+    defer has.deinit();
+    var lacks = try RelationalTriplet.init(gpa, "cache", "lacks", "entries", 0.9);
+    defer lacks.deinit();
+
+    try std.testing.expect(!pipeline.checkConsistency(&has, &lacks));
+    try std.testing.expect(pipeline.checkConsistency(&has, &has));
+}
+
+test "CREV full stream populates knowledge index and kernel memory" {
+    const gpa = std.testing.allocator;
+    var kernel = ChaosCoreKernel.init(gpa);
+    defer kernel.deinit();
+    var pipeline = try CREVPipeline.init(gpa, &kernel);
+    defer pipeline.deinit();
+    pipeline.setValidationThreshold(0.3);
+    pipeline.tokenizer_config.min_confidence_threshold = 0.2;
+
+    const result = try pipeline.processTextStream("The scheduler is a background service. The scheduler has retries.");
+    try std.testing.expect(result.triplets_extracted >= 1);
+    try std.testing.expect(pipeline.getKnowledgeGraphSize() >= 1);
+    try std.testing.expect(kernel.memoryCount() >= 1);
+
+    var matches = try pipeline.knowledge_index.queryMorphemeAware("the scheduler", null, null, gpa);
+    defer matches.deinit();
+    try std.testing.expect(matches.items.len >= 1);
+}
+
+test "ChaosCoreKernel allocates tagged memory and synchronizes graph" {
+    const gpa = std.testing.allocator;
+    var kernel = ChaosCoreKernel.init(gpa);
+    defer kernel.deinit();
+    const index = try kernel.allocateMemory("runtime|state|active|1.0", "triplet");
+    try std.testing.expectEqual(@as(usize, 0), index);
+    try std.testing.expectEqualStrings("runtime|state|active|1.0", kernel.getMemory(0).?);
+    const synchronized = try kernel.synchronizeGraphWithMemory();
+    try std.testing.expectEqual(@as(usize, 1), synchronized);
+    try std.testing.expectEqual(@as(usize, 1), kernel.graph.nodeCount());
+}
+
+test "validatedFactsJson renders triplets as valid JSON" {
+    const gpa = std.testing.allocator;
+    var index = KnowledgeGraphIndex.init(gpa);
+    defer index.deinit();
+    const triplet = try gpa.create(RelationalTriplet);
+    triplet.* = try RelationalTriplet.init(gpa, "agent", "owns", "workspace", 0.9);
+    try index.index(triplet);
+    const json = try validatedFactsJson(gpa, &index);
+    defer gpa.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    const array = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 1), array.items.len);
+    try std.testing.expectEqualStrings("agent", objectGetString(array.items[0], "subject").?);
+}
+
+test "skillNumericId is deterministic per skill identifier" {
+    const first = skillNumericId("skill_decompose_goal");
+    const second = skillNumericId("skill_decompose_goal");
+    const other = skillNumericId("skill_append_unique_log");
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(first != other);
+}
+
+test "MGT SSI Ranker retrieval chain ranks relevant skill first" {
+    const gpa = std.testing.allocator;
+    var mgt = try MGT.init(gpa, &.{}, &.{}, null, .dual);
+    defer mgt.deinit();
+    var ssi = SSI.init(gpa);
+    defer ssi.deinit();
+    var ranker = try Ranker.init(gpa, 4, 64, 0xA637200C4F12B551);
+    defer ranker.deinit();
+
+    var goal_tokens = std.ArrayList(u32).init(gpa);
+    defer goal_tokens.deinit();
+    try mgt.encode("split the goal into subgoals and record constraints", &goal_tokens);
+    try ssi.addSequence(goal_tokens.items, skillNumericId("skill_goal"), true);
+
+    var log_tokens = std.ArrayList(u32).init(gpa);
+    defer log_tokens.deinit();
+    try mgt.encode("append unique log lines without duplicates", &log_tokens);
+    try ssi.addSequence(log_tokens.items, skillNumericId("skill_log"), true);
+
+    var query_tokens = std.ArrayList(u32).init(gpa);
+    defer query_tokens.deinit();
+    try mgt.encode("the goal is planning and subgoals are empty", &query_tokens);
+
+    const candidates = try ssi.retrieveTopK(query_tokens.items, 8, gpa);
+    defer freeRankedSegments(candidates, gpa);
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try ranker.rankCandidatesWithQuery(candidates, query_tokens.items, &ssi, gpa);
+    try std.testing.expect(candidates[0].position == skillNumericId("skill_goal"));
+}
+
+test "tokensToJson produces parseable token array" {
+    const gpa = std.testing.allocator;
+    const tokens = [_]u32{ 10, 20, 30 };
+    const json = try tokensToJson(gpa, &tokens);
+    defer gpa.free(json);
+    try std.testing.expectEqualStrings("[10,20,30]", json);
+}
+
+test "consumeBufferedLine shifts and shrinks buffer" {
+    const gpa = std.testing.allocator;
+    var buffer = std.ArrayList(u8).init(gpa);
+    defer buffer.deinit();
+    try buffer.appendSlice("first\nsecond\nthird");
+    const nl = std.mem.indexOfScalar(u8, buffer.items, '\n').?;
+    consumeBufferedLine(&buffer, nl);
+    try std.testing.expectEqualStrings("second\nthird", buffer.items);
+}
+
+test "graph substrate nodes edges and coherence" {
+    const gpa = std.testing.allocator;
+    var graph = SelfSimilarRelationalGraph.init(gpa);
+    defer graph.deinit();
+    const node_a = try Node.initWithComplex(gpa, "n1", "subject", Complex(f64).init(0.8, 0.6), 0.1);
+    try graph.addNode(node_a);
+    const node_b = try Node.init(gpa, "n2", "object");
+    try graph.addNode(node_b);
+    var edge = try Edge.initWithComplex(gpa, "n1", "n2", .coherent, 0.9, Complex(f64).init(0.8, 0.6), 1.0);
+    try edge.setMetadata("relation", "is_a");
+    try graph.addEdge(edge);
+    try std.testing.expectEqual(@as(usize, 2), graph.nodeCount());
+    try std.testing.expectEqual(@as(usize, 1), graph.edgeCount());
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), graph.coherenceRatio(), 0.0001);
+    try std.testing.expectEqualStrings("is_a", graph.edges.items[0].getMetadata("relation").?);
+}
+
+test "extractJsonObject finds embedded envelope" {
+    const gpa = std.testing.allocator;
+    const text = "prefix noise {\"state_patch\":{\"done\":true},\"action\":{\"type\":\"finish\",\"args\":{}}} trailing";
+    const extracted = try extractJsonObject(gpa, text);
+    defer gpa.free(extracted);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, extracted, .{});
+    defer parsed.deinit();
+    try std.testing.expect(objectGetValue(parsed.value, "state_patch") != null);
+}
+
+test "isHttpHostAllowed enforces scheme and host list" {
+    try std.testing.expect(isHttpHostAllowed("*", "https://example.com/api"));
+    try std.testing.expect(isHttpHostAllowed("example.com,api.local", "http://api.local/x"));
+    try std.testing.expect(!isHttpHostAllowed("example.com", "http://api.local/x"));
+    try std.testing.expect(!isHttpHostAllowed("*", "ftp://example.com/x"));
+}
+
